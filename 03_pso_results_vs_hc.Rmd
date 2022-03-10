@@ -1,0 +1,725 @@
+---
+title: "PSO-SVM results vs HC"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 4
+    highlight: kate
+    df_print: paged
+---
+
+In this script, we load the results from the particle swarm based classifier in script 2 and determine performance on the validation dataset. This is an equivalent analysis to the report of the same number in the `pso-vs-hc` directory, but we have rerun the particle swarm after receiving an update to the sample metadata (specifically age & isolationlocation.)
+
+```{r, include=F}
+library(edgeR)
+library(RUVSeq)
+library(RColorBrewer)
+library(glmnet)
+library(here)
+library(foreach)
+library(doParallel)
+library(e1071)
+library(ROCR)
+library(pROC)
+library(ggsci)
+library(ggthemes)
+library(tidyverse)
+
+theme_set(theme_bw())
+```
+
+
+## Recap sample allocation
+
+Samples are subsetted down to breast cancer vs healthy controls, normalized, and matched between training, evaluation and validation sets for age and stage.
+
+See notebook one for details.
+
+HC vs BrCa table:
+
+```{r}
+dgeFiltered <- readRDS(here("Rds/01_dgeFiltered.Rds"))
+
+#dgeFiltered$samples %>% colnames() %>% tail()
+dgeFiltered$samples %>%
+  select(Label, group) %>%
+  table()
+```
+
+By stage:
+
+```{r}
+dgeFiltered$samples %>%
+  select(Label, stage) %>%
+  table()
+```
+```{r}
+dgeFiltered$samples %>%
+  ggplot(aes(x = Label,  fill = stage)) +
+  geom_bar() +
+  ggsci::scale_fill_nejm() +
+  ggtitle("Stage distribution across sample labels")
+
+```
+
+By age:
+
+```{r}
+dgeFiltered$samples %>%
+  ggplot(aes(x = Label, y = Age, fill = Label)) +
+  geom_boxplot() +
+  ggsci::scale_fill_nejm() +
+  ggtitle("Age distribution across sample labels")
+```
+
+## Load PSO 
+
+```{r}
+psoDir <- here("pso-enhanced-thromboSeq1")
+```
+
+
+Adapted from VUMC code:
+
+```{r}
+get_best_model <- function(pso.output.log.file){
+  # Select the best parameter setting
+  logged.PSO.distribution <- read.csv(pso.output.log.file, sep = "\t")
+  logged.PSO.distribution <- logged.PSO.distribution[order(logged.PSO.distribution$objective_function), ]
+  logged.PSO.distribution.Index <- logged.PSO.distribution[which(logged.PSO.distribution$objective_function ==
+                                                                   min(logged.PSO.distribution$objective_function)),]
+  set.seed(1000)
+  # in case more particles have the same AUC output value, select randomly one as the particle for readout
+  if (nrow(logged.PSO.distribution.Index) > 1){
+      logged.PSO.distribution.Index <- logged.PSO.distribution.Index[
+        sample(1 : nrow(logged.PSO.distribution.Index), size = 1),
+        ]
+    }
+  best.selection <- paste(logged.PSO.distribution.Index[, c(seq(2,ncol(logged.PSO.distribution.Index)-2, by=1))], collapse = "-") # collapse data
+  
+  print(paste("Best selection: ", best.selection, sep = ""))
+  return(best.selection)
+}
+
+```
+
+```{r}
+#read.csv( here("pso-enhanced-thromboSeq/ppso.log"), sep = "\t")
+#read.csv( here("pso-enhanced-thromboSeq/ppso.pro"), sep = "\t")
+best.selection.pso <- get_best_model(pso.output.log.file = file.path(psoDir,"ppso.log"))
+```
+
+Load it from here. Because the PPSO uses RData instead of Rds, the object is always called "dgeTraining" upon loading.
+
+```{r}
+particle_path <- file.path(psoDir,"outputPSO",paste0(best.selection.pso,".RData"))
+load(particle_path)
+names(dgeTraining)
+
+saveRDS(dgeTraining, here("Rds/03_dgeParticle.Rds"))
+```
+
+Currently, this number of biomarkers selected by PSO is:
+
+```{r}
+length(dgeTraining$biomarker.transcripts )
+```
+
+## PSO performance
+
+The provided function in [ThromboSeq](https://github.com/MyronBest/thromboSeq_source_code) for assessing PSO performance, `ThromboseqPSO.Readout()` is a bit glitchy and crashes often. We'll isolate the necessary code to get the readout for validation.
+
+```{r}
+train.samples <- colnames(dgeFiltered)[dgeFiltered$samples$Training]
+
+eval.samples <- colnames(dgeFiltered)[dgeFiltered$samples$Evaluation]
+
+val.samples <- colnames(dgeFiltered)[dgeFiltered$samples$Validation]
+
+#Should be no overlap
+stopifnot(length(Reduce(intersect, list(train.samples,eval.samples,val.samples)) > 0)==0) 
+```
+
+The relevant function is thrombo.algo.classify.validation.set(), using dgeFiltered as main input:
+
+```{r}
+dgeFiltered %>% names()
+```
+
+thrombo.algo.classify.validation.set() relies on perform.RUVg.correction.validation().
+This is the same as perform.RUVg.correction(), but with known stable transcripts, confounding axes, and correction factors from the PSO-SVM.
+
+We'll make some minor changes to this function to allow specifiying early and late stage validation sets.
+
+```{r}
+#Dependency functions
+source(here("bin/thromboSeqTools_PSO.R"))
+source(here("bin/thromboSeqTools_PreProcessing_2.R"))
+source(here("bin/thromboSeqTools_ANOVA.R"))
+
+alt.thrombo.algo.classify.validation.set <- function(dge = dgeFiltered, 
+                                                 best.particle = best.particle.input, 
+                                                 iterations = FALSE,
+                                                 n_iter = NULL,
+                                                 replace.counts.validation = NaN, #Was 0 by default (mixes training and validation)
+                                                 path.best.particle = particle.path,
+                                                 R.snapshot = "Pre-PSO-snapshot.RData",
+                                                 verbose = TRUE,
+                                                 validation.samples = NULL,
+                                                 training.samples = NULL,
+                                                 evaluation.samples = NULL){
+  # Performs classification of samples included in the validation series in a PSO-optimized
+  # classification algorithm.
+  #
+  # Args:
+  #   dge: DGEList with dataset count table, sample info and gene info tables.
+  #   best.particle: Vector with the merged best.selection values.
+  #   iterations: Whether or not (TRUE/FALSE) this function is called in the iterations control experiments.
+  #   iter: Numeric value with the number of the iteration (only when iterations == TRUE).
+  #   replace.counts.validation: Numeric-value indicating the number of reads counts (0 - value) 
+  #   at which the validation series samples will be supplemented by counts from the training series. In
+  #   case of "NaN" this step will be omitted.
+  #   R.snapshot: String with RData-file name in which the R environment has been stored.
+  #   verbose: Whether to print output or not (TRUE/FALSE).
+  #
+  # Returns:
+  #   Result-container with classification details and metrics.
+  
+  # load R snapshot data
+  load(R.snapshot)
+  # load data according to whether the iterations are enabled or not
+
+  #This part we don't need, we're not interested in LOOCV on the training set alone
+  
+  #if (iterations == TRUE){
+  #  load(paste("outputIterations/", n_iter, "-Pre-PSO-like.RData", sep = ""))
+  #  load(paste("outputIterations/", n_iter, "-dgeParticle.RData", sep = ""))
+    
+  #  training.samples <- as.character(read.csv(
+  #    paste("outputIterations/", n_iter, "-trainingSamples_subsampling.csv", sep = ""))[, 2])
+  #  evaluation.samples <- as.character(read.csv(
+  #    paste("outputIterations/", n_iter, "-evaluationSamples_subsampling.csv", sep = ""))[, 2])
+  #} else {
+    # load particle-specific output file
+    #load(paste("outputPSO/", best.particle, ".RData", sep = ""))
+    
+  load(path.best.particle)
+  #Prevents namespace confusion?
+  dgeParticle <- dgeTraining
+  #}
+  
+  # assign samples to training and evaluation
+  #validation.samples <- colnames(dge)[!colnames(dge) %in% c(training.samples, evaluation.samples)]
+
+  # narrow the dge to those samples relevant
+  dge <- dge[, c(training.samples, validation.samples)]
+  dge$samples <- droplevels(dge$samples)
+  
+  real.groups.training <- dge$samples[training.samples, "group"]
+  real.groups.validation <- dge$samples[validation.samples, "group"]
+  
+  # perform RUV correction
+  dgeTraining <- perform.RUVg.correction.validation(dge = dge, 
+                                                    output.particle = dgeParticle)
+  dgeTraining$counts <- dgeTraining$ruv.counts
+  
+  # enable to replace counts with 0 to provided counts in the validation series
+  # by the median of those in the training series.
+  # Doing so mixes training and validation and is therefore unadavised
+  if (!replace.counts.validation %in% c("NaN", NaN)){ # omit this function when NaN is inputted
+    for (assess.sample in validation.samples) { # for each sample in the validation series
+      tmpA <- matrix(dgeTraining$counts[, assess.sample]) # select the counts
+      sel <- which(tmpA %in% seq(0, replace.counts.validation)) # identify which counts have too little raw reads detected
+      if (length(sel) > 1){ # if more than one selected, calculate median read counts of these genes in the training series and replace
+        tmpB <- round(apply(dgeTraining$counts[sel, training.samples], 1, median))
+        dgeTraining$counts[which(dgeTraining$counts[, assess.sample] %in% seq(0, replace.counts.validation)), assess.sample] <- tmpB
+      } else if (length(sel) == 1) { # if one selected, calculate median read counts of this gene in the training series and replace
+        tmpB <- round(median(as.numeric(dgeTraining$counts[sel, ])))
+        dgeTraining$counts[which(dgeTraining$counts[, assess.sample] %in% seq(0, replace.counts.validation)), assess.sample] <- tmpB
+      }
+    }
+  }
+  
+  # calculate newest total read counts (lib.size)
+  dgeTraining$samples$lib.size <- colSums(dgeTraining$counts)
+  dgeTraining <- calcNormFactorsThromboseq(dgeTraining,
+                                           normalize.on.training.series = TRUE, #Is true in original 
+                                           samples.for.training = training.samples,
+                                           ref.sample.readout = FALSE) # calculate normalization factors, false in original
+  dgeTraining$samples <- droplevels(dgeTraining$samples)
+  
+  # calculate counts-per-million matrix (log-transformed and normalized via the TMM-normalization factor)
+  # IMPORTANT Only validation samples are input for predict function
+  normalized.counts.prediction <- cpm(dgeTraining, log = T, normalized.lib.sizes = T)[dgeParticle$biomarker.transcripts, validation.samples] #Validation only
+  # perform classification
+  prediction.class <- predict(dgeParticle$tuned.svm.model,
+                              newdata = t(normalized.counts.prediction), 
+                              probability = TRUE)
+  confusion.matrix <- table(prediction.class, real.groups.validation)
+  confusion.matrix.evaluated <- classAgreement(confusion.matrix, match.names = T)
+  
+  # create classification overview
+  svm.summary <- data.frame(
+    sampleName = attributes(prediction.class)$names,
+    predicted.group = as.character((prediction.class)[1:length(prediction.class)]),
+    real.group = real.groups.validation
+  )
+  svm.summary <- cbind(svm.summary, 
+                       data.frame(attributes(prediction.class)$probabilities[,
+                                                                             which(colnames(attributes(prediction.class)$probabilities) == levels(prediction.class)[1])]),
+                       data.frame(attributes(prediction.class)$probabilities[,
+                                                                             which(colnames(attributes(prediction.class)$probabilities) == levels(prediction.class)[2])])
+  )
+  colnames(svm.summary)[c(4:5)] <- levels(prediction.class)
+  
+  # prepare output, for binary comparison calculate AUC-value, and for multiclass comparison the overall accuracy
+  if (nlevels(dgeTraining$samples$group) == 2){
+    # ROC
+    rocra <- prediction(as.numeric(as.character(svm.summary[, 5])), 
+                        svm.summary[, 3], 
+                        label.ordering = levels(dgeTraining$samples$group))
+    perfa <- performance(rocra, "tpr", "fpr")
+    AUC <- attributes(performance(rocra, 'auc'))$y.values[[1]]
+    if (verbose == TRUE){
+      print(paste("AUC Validation Series: ", attributes(performance(rocra, 'auc'))$y.values[[1]], 
+                  sep = ""))
+    }
+    roc.summary <- data.frame(
+      cutOffs = unlist(attributes(rocra)$cutoffs),
+      tp = unlist(attributes(rocra)$tp),
+      tn = unlist(attributes(rocra)$tn),
+      fp = unlist(attributes(rocra)$fp),
+      fn = unlist(attributes(rocra)$fn),
+      accuracy = (unlist(attributes(rocra)$tp) + unlist(attributes(rocra)$tn)) /
+        (unlist(attributes(rocra)$fp) + unlist(attributes(rocra)$tn) + unlist(attributes(rocra)$tp) + unlist(attributes(rocra)$fn)),
+      xValues = unlist(attributes(perfa)$x.values),
+      yValues = unlist(attributes(perfa)$y.values)
+    )
+    roc.optimal.accuracy <- max(roc.summary$accuracy)
+    
+    # calculate confidence interval
+    roc.95ci <- roc(svm.summary$real,
+                    svm.summary[, ncol(svm.summary)], 
+                    ci = TRUE
+    )
+    
+  } else {
+    AUC <- NA
+    roc.95ci <- list(NA)
+    roc.95ci$ci <- NA
+    roc.optimal.accuracy <- confusion.matrix.evaluated$diag
+    perfa <- NA
+    roc.summary <- NA
+  }
+  
+  # summarize data
+  result <- list()
+  result[["samples.for.training"]] <- training.samples
+  result[["samples.for.validation"]] <- validation.samples
+  result[["biomarker.panel.size"]] <- length(dgeParticle$biomarker.transcripts)
+  result[["ruv.confounding.axes"]] <- dgeParticle$axis.confounding
+  result[["svm.summary"]] <- svm.summary
+  result[["confusion.matrix"]] <- confusion.matrix
+  result[["confusion.matrix.evaluated"]] <- confusion.matrix.evaluated
+  result[["AUCorDiagonal"]] <- AUC
+  result[["ci.roc"]] <- roc.95ci
+  result[["roc.optimal.accuracy"]] <- roc.optimal.accuracy
+  result[["perfa"]] <- perfa
+  result[["ROC"]] <- roc.summary
+  result
+  return(result)
+}
+```
+
+
+## All stages
+
+With RUVg normalization.
+
+```{r, warning=FALSE}
+#Sanity check, make sure there's no overlap
+if(length(Reduce(intersect, list(train.samples,eval.samples,val.samples))) > 0){
+  stop("There should be no overlap.")
+}
+
+snapshot <- here("pso-enhanced-thromboSeq1/Pre-PSO-snapshot.RData")
+#file.exists(snapshot)
+
+ppso_results_allstages <- alt.thrombo.algo.classify.validation.set(dge = dgeFiltered, 
+                                                                   best.particle = best.selection.pso,
+                                                                   path.best.particle = particle_path,
+                                                                   iterations = FALSE,
+                                                                   n_iter = NULL,
+                                                                   replace.counts.validation = NaN,
+                                                                   R.snapshot = snapshot,
+                                                                   training.samples = train.samples,
+                                                                   evaluation.samples = eval.samples,
+                                                                   validation.samples = val.samples,
+                                                                   verbose = TRUE)
+```
+
+Confidence intervals:
+
+```{r}
+#names(ppso_results_allstages)
+ppso_results_allstages$ci.roc
+
+```
+
+### ROC
+
+```{r}
+plotthisroc <- function(df, title){
+  
+  roc.res <- pROC::roc(
+    #a factor, numeric or character vector of responses, typically encoded with 0 (controls) and 1 (cases)
+    response = df$real.group,
+    predictor = df$breastCancer
+  )
+  
+  rocobj <- plot.roc(roc.res,
+                     main = title, 
+                     percent=TRUE,
+                     #ci = TRUE,  #Finite xlim glitch 
+                     print.auc = TRUE,
+                     asp = NA)
+  
+  ciobj <- ci.se(rocobj,                         # CI of sensitivity
+                 specificities = seq(0, 1, 0.05)) # over a select set of specificities
+  plot(ciobj, type = "shape", col = "#1c61b6AA")     # plot as a blue shape
+  plot(ci(rocobj, of = "thresholds", thresholds = "best")) # add one threshold
+  
+}
+
+
+plotthisroc(ppso_results_allstages$svm.summary, title = "PSO-SVM all stages")
+```
+
+### Boxplot
+
+Add metadata to predictions.
+
+```{r}
+allstage <- ppso_results_allstages$svm.summary
+
+stopifnot(all(sort(allstage$sampleName) ==
+            sort(dgeFiltered$samples[dgeFiltered$samples$Label %in% c("Validation"),]$sampleName)))
+
+allstage <- allstage %>%
+  left_join(., select(dgeFiltered$samples, sampleName = sample_name,
+                       age= Age, stage, isolationlocation),
+             by="sampleName")
+```
+
+
+```{r}
+allstage %>%
+  ggplot(aes(x = real.group, y = breastCancer)) +
+  geom_jitter(aes(color = isolationlocation), height = 0 , width = 0.1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("PSO-SVM sample predictions: All stages")
+```
+
+### Confusion matrix
+
+```{r}
+allstage$predicted.group <- factor(allstage$predicted.group,
+                                   levels = c("healthyControl", "breastCancer"))
+allstage$real.group <- factor(allstage$real.group,
+                              levels = c("healthyControl", "breastCancer"))
+
+caret::confusionMatrix(data = allstage$predicted.group,
+                       reference = allstage$real.group,
+                       positive = "breastCancer",
+                       mode = "everything")
+```
+
+### Write sample predictions
+
+Per request, save the sample predictions.
+
+```{r}
+write_csv(allstage,
+          here("03_pso_sample_predictions.csv"))
+```
+
+## Early stage (I-II)
+
+The function `thrombo.algo.classify.validation.set` (and the slightly altered version in this notebook, `alt.thrombo.algo.classify.validation.set`) performs RUV normalization as one of its steps, which alters the count matrix. This means that performance is assessed this way on all samples and then again on a subset of those samples (i.e. early stage and controls only), the sample predictions are altered slightly. We can see this happening below:
+
+```{r, warning=FALSE}
+#dgeFiltered$samples %>% select(Validation, stage)
+#levels(dgeFiltered$samples$stage)
+earlyval.samples <- rownames(filter(dgeFiltered$samples, Validation == T & stage %in% c("I","II", "healthyControl")))
+stopifnot(all(earlyval.samples %in% colnames(dgeFiltered)))
+
+#Sanity check, make sure there's no overlap
+if(length(Reduce(intersect, list(train.samples,eval.samples,earlyval.samples))) > 0){
+  stop("There should be no overlap.")
+}
+
+
+
+ppso_results_earlystage <- alt.thrombo.algo.classify.validation.set(dge = dgeFiltered, 
+                                                                    best.particle = best.selection.pso,
+                                                                    path.best.particle = particle_path,
+                                                                    iterations = FALSE,
+                                                                    n_iter = NULL,
+                                                                    replace.counts.validation = NaN,
+                                                                    R.snapshot = snapshot,
+                                                                    training.samples = train.samples,
+                                                                    evaluation.samples = eval.samples,
+                                                                    validation.samples = earlyval.samples,
+                                                                    verbose = TRUE)
+
+#The results are not quite the same
+right_join(select(ppso_results_allstages$svm.summary, sampleName, healthyControl.all = healthyControl), 
+           select(ppso_results_earlystage$svm.summary, sampleName, healthyControl.early = healthyControl),
+           by= "sampleName") %>%
+  head()
+```
+
+Therefore, instead of calling the wrapper function on early stage samples, we calculate AUC and other stats on a subset of the results from all stages.
+
+```{r}
+earlyval.samples <- rownames(filter(dgeFiltered$samples, Validation == T & stage %in% c("I","II", "healthyControl")))
+stopifnot(all(earlyval.samples %in% colnames(dgeFiltered)))
+
+early.roc <- pROC::roc(
+    #a factor, numeric or character vector of responses, typically encoded with 0 (controls) and 1 (cases)
+    response = filter(allstage, sampleName %in% earlyval.samples)$real.group,
+    predictor = filter(allstage, sampleName %in% earlyval.samples)$breastCancer
+  )
+
+
+pROC::auc(early.roc) #equivalent to early.roc$auc
+```
+
+Confidence intervals:
+
+```{r}
+pROC::ci.auc(early.roc)
+```
+
+### ROC
+
+```{r}
+plotthisroc(filter(ppso_results_allstages$svm.summary, sampleName %in% earlyval.samples),
+            title = "PSO-SVM early stages")
+```
+
+### Boxplot
+
+Add metadata to predictions.
+
+```{r}
+earlystage <- filter(ppso_results_allstages$svm.summary, sampleName %in% earlyval.samples)
+
+stopifnot(all(sort(earlystage$sampleName) ==
+            sort(dgeFiltered$samples[dgeFiltered$samples$Label %in% c("Validation"),]$sampleName)))
+
+earlystage <- earlystage %>%
+  left_join(., select(dgeFiltered$samples, sampleName = sample_name,
+                       age= Age, stage, isolationlocation),
+             by="sampleName")
+```
+
+```{r}
+earlystage %>%
+  ggplot(aes(x = real.group, y = breastCancer)) +
+  geom_jitter(aes(color = isolationlocation), height = 0 , width = 0.1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("PSO-SVM sample predictions: Early stage")
+```
+
+### Confusion matrix
+
+```{r}
+earlystage$predicted.group <- factor(earlystage$predicted.group,
+                                     levels = c("healthyControl", "breastCancer"))
+earlystage$real.group <- factor(earlystage$real.group,
+                                levels = c("healthyControl", "breastCancer"))
+
+caret::confusionMatrix(data = earlystage$predicted.group,
+                       reference = earlystage$real.group,
+                       positive = "breastCancer",
+                       mode = "everything")
+```
+
+## Late stage (III-IV)
+
+As above, subsetting total results to late stage samples and recalculating AUC.
+
+```{r}
+lateval.samples <- rownames(filter(dgeFiltered$samples,
+                                   Validation == T & stage %in% c("III","IV", "healthyControl")))
+stopifnot(all(lateval.samples %in% colnames(dgeFiltered)))
+
+#Sanity check, make sure there's no overlap
+if(length(Reduce(intersect, list(train.samples,eval.samples,lateval.samples))) > 0){
+  stop("There should be no overlap.")
+}
+
+late.roc <- pROC::roc(
+    #a factor, numeric or character vector of responses, typically encoded with 0 (controls) and 1 (cases)
+    response = filter(allstage, sampleName %in% lateval.samples)$real.group,
+    predictor = filter(allstage, sampleName %in% lateval.samples)$breastCancer
+  )
+
+
+pROC::auc(late.roc)
+```
+
+Confidence intervals:
+
+```{r}
+pROC::ci.auc(late.roc)
+```
+
+### ROC
+
+```{r}
+plotthisroc(filter(allstage, sampleName %in% lateval.samples),
+            title = "PSO-SVM late stages")
+```
+
+### Boxplot
+
+Add metadata to predictions.
+
+```{r}
+latestage <- filter(ppso_results_allstages$svm.summary, sampleName %in% lateval.samples)
+
+stopifnot(all(sort(latestage$sampleName) ==
+            sort(dgeFiltered$samples[dgeFiltered$samples$Label %in% c("Validation"),]$sampleName)))
+
+latestage <- latestage %>%
+  left_join(., select(dgeFiltered$samples, sampleName = sample_name,
+                       age= Age, stage, isolationlocation),
+             by="sampleName")
+```
+
+```{r}
+latestage %>%
+  ggplot(aes(x = real.group, y = breastCancer)) +
+  geom_jitter(aes(color = isolationlocation), height = 0 , width = 0.1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("PSO-SVM sample predictions: Late stage")
+```
+
+### Confusion matrix
+
+```{r}
+latestage$predicted.group <- factor(latestage$predicted.group,
+                                     levels = c("healthyControl", "breastCancer"))
+latestage$real.group <- factor(latestage$real.group,
+                                levels = c("healthyControl", "breastCancer"))
+
+caret::confusionMatrix(data = latestage$predicted.group,
+                       reference = latestage$real.group,
+                       positive = "breastCancer",
+                       mode = "everything")
+```
+
+## Summary
+
+### AUC and features
+
+```{r}
+df.summary <- tibble(Metric=c("Validation all stages", "Validation early", "Validation late",
+                                     #"Dependent evaluation series", "LOOCV training series", #Not finished
+                                     "Feature selection"
+                                     ),
+                         PPSO_brca_vs_hc = c(
+                           signif(pROC::roc(response = allstage$real.group, predictor = allstage$breastCancer)$auc,2),
+                           signif(pROC::roc(response = earlystage$real.group, predictor = earlystage$breastCancer)$auc,2),
+                           signif(pROC::roc(response = latestage$real.group, predictor = latestage$breastCancer)$auc,2),
+                           as.integer(length(dgeTraining$biomarker.transcripts))
+                           )
+                     )
+df.summary
+
+
+```
+
+```{r}
+write.csv(df.summary, here("03_pso_performance_summary.csv"))
+```
+
+### Detailed stats
+
+Note: Specificity is the same among the different stages because the controls are shared between them.
+
+```{r}
+pretty_ci <- function(auc, conf.level = 0.95, return){
+  stopifnot(return %in% c("lower","upper","range"))
+  
+  if(return == "lower"){
+    return(signif(pROC::ci(auc, conf.level = conf.level)[1], 4))
+  }
+  
+  if(return == "upper"){
+    return(signif(pROC::ci(auc, conf.level = conf.level)[3], 4))
+  }
+  
+  if(return == "range"){
+    paste(signif(pROC::ci(auc, conf.level = conf.level)[1], 4),
+        signif(pROC::ci(auc, conf.level = conf.level)[3], 4),
+        sep="-")
+  }
+  
+}
+
+#List of AUCs and CIs
+aucs <- list(
+  allstage = pROC::roc(response = allstage$real.group, predictor = allstage$breastCancer),
+  earlystage = pROC::roc(response = earlystage$real.group, predictor = earlystage$breastCancer),
+  latestage = pROC::roc(response = latestage$real.group, predictor = latestage$breastCancer)
+  )
+#List of confusion matrices
+confMats <- list(
+  confMat = caret::confusionMatrix(data = allstage$predicted.group,
+                       reference = allstage$real.group,
+                       positive = "breastCancer",
+                       mode = "everything"),
+  confMat_early = caret::confusionMatrix(data = earlystage$predicted.group,
+                       reference = earlystage$real.group,
+                       positive = "breastCancer",
+                       mode = "everything"),
+  confMat_late = caret::confusionMatrix(data = latestage$predicted.group,
+                       reference = latestage$real.group,
+                       positive = "breastCancer",
+                       mode = "everything")
+  )
+
+
+detailed.summary <- tibble(
+  Stage = c("All stages", "Early (I-II)", "Late (III-IV)"),
+  Model = "PSO-SVM",
+  Features = length(dgeTraining$biomarker.transcripts),
+  AUC = sapply(aucs, function(x) x$auc),
+  CI.95.lower = sapply(aucs, function(x) pretty_ci(x, return = "lower")),
+  CI.95.upper = sapply(aucs, function(x) pretty_ci(x, return = "upper")),
+  Sensitivity = sapply(confMats, function(x) x$byClass[names(x$byClass)=="Sensitivity"]),
+  Specificity = sapply(confMats, function(x) x$byClass[names(x$byClass)=="Specificity"]),
+  Precision = sapply(confMats, function(x) x$byClass[names(x$byClass)=="Precision"]),
+  Recall = sapply(confMats, function(x) x$byClass[names(x$byClass)=="Recall"]),
+  F1 = sapply(confMats, function(x) x$byClass[names(x$byClass)=="F1"])
+  )
+
+
+detailed.summary
+```
+
+Write detailed summary
+
+```{r}
+write_csv(detailed.summary, here("03_pso_detailed_stats.csv"))
+```
+
+```{r}
+sessionInfo()
+```

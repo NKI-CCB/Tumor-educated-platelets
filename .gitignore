@@ -1,39 +1,36 @@
-# History files
-.Rhistory
-.Rapp.history
+#Ignore data output files
+*Rds
+*html
+*csv
+*xlsx
+*.txt
+*tar.gz
+*img
 
-# Session Data files
-.RData
+#Data storage or output directories
+dataset/
+figureOutputFolder/
+figures_thromboseqQC/
 
-# User-specific files
-.Ruserdata
+#PSO output files and directories
+pso-enhanced-thromboSeq/
+pso-enhanced-thromboSeq1/
+previous_pso_runs
 
-# Example code in package build process
-*-Ex.R
+#Ignore various non-code file types
+*.Rproj
+*.RData
+*.Rhistory
+*.Rdata
+*.html
+*.csv
+*.pdf
+*.png
 
-# Output files from R CMD build
-/*.tar.gz
+#Occasional stray temporary file from knitting
+*.md
+!README.md
+.Rproj.user
+**pycache**
+*.snakemake/
 
-# Output files from R CMD check
-/*.Rcheck/
-
-# RStudio files
-.Rproj.user/
-
-# produced vignettes
-vignettes/*.html
-vignettes/*.pdf
-
-# OAuth2 token, see https://github.com/hadley/httr/releases/tag/v0.3
-.httr-oauth
-
-# knitr and R markdown default cache directories
-*_cache/
-/cache/
-
-# Temporary files created by R markdown
-*.utf8.md
-*.knit.md
-
-# R Environment Variables
-.Renviron

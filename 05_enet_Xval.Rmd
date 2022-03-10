@@ -1,0 +1,416 @@
+---
+title: "Breast cancer vs healthy controls: Elastic net with nested cross-validation"
+author: Kat Moore
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    highlight: kate
+    df_print: paged
+---
+
+An evaluation of baseline elastic net performance using breast cancer and healthy control samples from the TEP dataset using a cross-validation loop.
+
+```{r, include=F}
+library(edgeR)
+#library(RUVSeq)
+#library(openxlsx)
+library(RColorBrewer)
+library(glmnet)
+library(here)
+library(foreach)
+library(doParallel)
+#library(e1071)
+library(caret)
+library(pROC)
+library(tidyverse)
+library(ggthemes)
+library(ggsci)
+library(ggpubr)
+
+theme_set(theme_bw())
+```
+
+This will be done using the same dataset we used for the earlier notebooks in this series:
+
+```{r}
+dgeFiltered <- readRDS(here("Rds/01_dgeFiltered.Rds")) 
+```
+
+This is the TEP dataset we received from the VUMC in Dec 2018.
+It has been pre-filtered to select reads which span the splice junction.
+In notebook one, we applied a minimum count filter and leave-one-out cross-correlation.
+This is the class distribution of samples that remain:
+
+```{r}
+table(dgeFiltered$samples$group)
+```
+
+## Leave-one-out cross-validation
+
+We ran LOOCV in `05_enet_xval.R`. It took around 3 hours to complete with 16 cores.
+
+```{r load results}
+modelList <- readRDS(here("Rds", "05_LOOCV_enet.Rds"))
+```
+
+We should have as many models as we do samples.
+
+```{r}
+length(modelList) == ncol(dgeFiltered)
+```
+As before, each element in the list has three components: fit, train and test.
+
+Fit is a train-class object produced by caret, with alpha and lambda tuned.
+Train and test are both lists containing elements matching either the training samples or the left-out sample (test).
+
+The lists contain:
+a) data, a samples x genes matrix used to either train the data or representing the left-out sample
+b) labels, the true class labels belonging to the samples in that data partition.
+
+For example:
+
+```{r}
+modelList[[1]]$fit$bestTune
+modelList[[1]]$train$data[1:4,1:4]
+modelList[[1]]$test$labels
+```
+
+Apply names to list to match the left out sample:
+
+```{r}
+names(modelList) <- lapply(
+  modelList, function(x) x$test$labels$sample_name) %>%
+  unlist()
+
+stopifnot(names(modelList)[[1]] == modelList[[1]]$test$labels$sample_name)
+```
+
+### Hyperparameters
+
+The majority of models selected alpha = 0.1.
+
+```{r}
+hyperparams <- lapply(modelList, function(x) x$fit$bestTune) %>%
+  bind_rows(.id = "sample") 
+
+hyperparams %>%
+  group_by(alpha) %>%
+  count()
+```
+
+In a few cases where alpha = 0, lambda is very high.
+
+```{r}
+hyperparams %>%
+  ggplot(aes(x = alpha, y = lambda)) +
+  geom_jitter() +
+  scale_y_log10() +
+  ggtitle("Best alpha and lambda in LOOCV")
+```
+
+## Predictions
+
+Predict the left-out sample for the entire list.
+
+```{r make predictions}
+#modelList[[1]]$test$data[,1:4, drop=F]
+
+enet_pred <- function(x){
+  
+  fit <- x$fit
+  val_data <- x$test$data
+  
+  class = cbind(
+    sample = rownames(val_data),
+    predicted.group = as.character(predict(fit, newdata = val_data, type="raw"))
+  )
+  
+  #return(class)
+  
+  probs = predict(fit, newdata = val_data, type="prob")
+  #return(probs)
+  
+  colnames(probs) <- paste0("prob.",colnames(probs))
+  probs$model <- "Enet LOOCV"
+  
+  
+  
+  cbind(class, probs)  
+  
+}
+
+#enet_pred(modelList[[1]])
+
+predictions <- lapply(modelList, enet_pred) %>%
+  bind_rows()
+
+head(predictions)
+
+#Should be no NAs
+stopifnot(all(rowSums(is.na(predictions))==0))
+```
+
+Add true class labels so we can assess performance, alongside stage and hyperparameters.
+
+```{r}
+predictions <- dgeFiltered$samples %>%
+  rownames_to_column("sample") %>%
+  select(sample, true.group = group, stage, isolationlocation) %>%
+  right_join(., predictions, by = "sample") %>%
+  left_join(., hyperparams, by = "sample")
+
+#Ensure levels are in the same order
+predictions$true.group <- factor(predictions$true.group, levels=c("healthyControl", "breastCancer"))
+predictions$predicted.group <- factor(predictions$predicted.group, levels=c("healthyControl", "breastCancer"))
+
+head(predictions)
+```
+
+## Performance
+
+```{r}
+predictions <- predictions %>% 
+  mutate(misclassified = (predicted.group != true.group))
+```
+
+### For all stages:
+
+```{r}
+auc_all <- pROC::roc(response = predictions$true.group,
+                     predictor = predictions$prob.breastCancer)
+
+auc_all
+```
+
+CI:
+
+```{r}
+pROC::ci.auc(auc_all)
+```
+
+#### ROC
+
+```{r aucplot1}
+plotmyroc <- function(roc.res, title){
+  rocobj <- pROC::plot.roc(roc.res,
+                           main = title, 
+                           percent=TRUE,
+                           #ci = TRUE,  #Finite xlim glitch         
+                           print.auc = TRUE,
+                           asp = NA)
+  
+  ciobj <- ci.se(rocobj,                         # CI of sensitivity
+                 specificities = seq(0, 1, 0.05)) # over a select set of specificities
+  plot(ciobj, type = "shape", col = "#1c61b6AA")     # plot as a blue shape
+  plot(ci(rocobj, of = "thresholds", thresholds = "best")) # add one threshold
+  
+}
+
+
+plotmyroc(auc_all, title = "Elastic net LOOCV: all stages")
+```
+
+Number of samples misclassified. Unsurprisingly, we miss more in the early stage.
+
+```{r}
+table(predictions$misclassified, predictions$stage)
+```
+
+#### Boxplot
+
+```{r}
+predictions %>%
+  ggplot(aes(x = true.group, y = prob.breastCancer)) +
+  geom_jitter(aes(color = isolationlocation), height = 0, width = 0.1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("LOOCV enet predictions: all stages")
+```
+
+### Early stage (I and II)
+
+```{r}
+predictions_early <- filter(predictions, stage %in% c("I", "II", "healthyControl"))
+
+auc_early <- pROC::roc(response = predictions_early$true.group,
+                       predictor = predictions_early$prob.breastCancer)
+
+auc_early
+```
+
+CI:
+
+```{r}
+pROC::ci.auc(auc_early)
+```
+
+#### ROC
+
+```{r aucplot2}
+plotmyroc <- function(roc.res, title){
+  rocobj <- pROC::plot.roc(roc.res,
+                           main = title, 
+                           percent=TRUE,
+                           #ci = TRUE,  #Finite xlim glitch         
+                           print.auc = TRUE,
+                           asp = NA)
+  
+  ciobj <- ci.se(rocobj,                         # CI of sensitivity
+                 specificities = seq(0, 1, 0.05)) # over a select set of specificities
+  plot(ciobj, type = "shape", col = "#1c61b6AA")     # plot as a blue shape
+  plot(ci(rocobj, of = "thresholds", thresholds = "best")) # add one threshold
+  
+}
+
+
+plotmyroc(auc_early, title = "Elastic net LOOCV: early stage (I and II)")
+```
+
+Number of samples misclassified:
+
+```{r}
+table(predictions_early$misclassified, predictions_early$stage)
+```
+
+#### Boxplot
+
+```{r}
+predictions_early %>%
+  ggplot(aes(x = true.group, y = prob.breastCancer)) +
+  geom_jitter(aes(color = isolationlocation), height = 0, width = 0.1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("LOOCV enet predictions: early stages")
+```
+
+### Late stage (III and IV)
+
+```{r}
+predictions_late <- filter(predictions, stage %in% c("III", "IV", "healthyControl"))
+
+auc_late <- pROC::roc(response = predictions_late$true.group,
+                       predictor = predictions_late$prob.breastCancer)
+
+auc_late
+```
+
+CI:
+
+```{r}
+pROC::ci.auc(auc_late)
+```
+
+```{r aucplot3}
+plotmyroc <- function(roc.res, title){
+  rocobj <- pROC::plot.roc(roc.res,
+                           main = title, 
+                           percent=TRUE,
+                           #ci = TRUE,  #Finite xlim glitch         
+                           print.auc = TRUE,
+                           asp = NA)
+  
+  ciobj <- ci.se(rocobj,                         # CI of sensitivity
+                 specificities = seq(0, 1, 0.05)) # over a select set of specificities
+  plot(ciobj, type = "shape", col = "#1c61b6AA")     # plot as a blue shape
+  plot(ci(rocobj, of = "thresholds", thresholds = "best")) # add one threshold
+  
+}
+
+
+plotmyroc(auc_late, title = "Elastic net LOOCV: late stage (III and IV)")
+```
+
+Number of samples misclassified:
+
+```{r}
+table(predictions_late$misclassified, predictions_late$stage)
+```
+
+## Confusion matrices
+
+All stages:
+
+```{r}
+confMat <- caret::confusionMatrix(data = predictions$predicted.group,
+                                  reference = predictions$true.group,
+                                  positive = "breastCancer",
+                                  mode = "everything")
+
+confMat
+```
+
+Early stage:
+
+```{r}
+confMat_early <- caret::confusionMatrix(data = predictions_early$predicted.group,
+                                        reference = predictions_early$true.group,
+                                        positive = "breastCancer",
+                                        mode = "everything")
+
+confMat_early
+```
+
+Late stage:
+
+```{r}
+confMat_late <- caret::confusionMatrix(data = predictions_late$predicted.group,
+                                        reference = predictions_late$true.group,
+                                        positive = "breastCancer",
+                                        mode = "everything")
+
+confMat_late
+```
+
+## Save results
+
+```{r}
+pretty_ci <- function(auc, conf.level = 0.95, return){
+  stopifnot(return %in% c("lower","upper","range"))
+  
+  if(return == "lower"){
+    return(signif(pROC::ci(auc, conf.level = conf.level)[1], 4))
+  }
+  
+  if(return == "upper"){
+    return(signif(pROC::ci(auc, conf.level = conf.level)[3], 4))
+  }
+  
+  if(return == "range"){
+    paste(signif(pROC::ci(auc, conf.level = conf.level)[1], 4),
+        signif(pROC::ci(auc, conf.level = conf.level)[3], 4),
+        sep="-")
+  }
+  
+}
+
+
+aucs <- list(auc_all, auc_early, auc_late)
+confMats <- list(confMat, confMat_early, confMat_late)
+
+
+auc.summary <- tibble(
+  Stage = c("All stages", "Early (I-II)", "Late (III-IV)"),
+  AUC = sapply(aucs, function(x) x$auc),
+  CI.95.lower = sapply(aucs, function(x) pretty_ci(x, return = "lower")),
+  CI.95.upper = sapply(aucs, function(x) pretty_ci(x, return = "upper")),
+  Sensitivity = sapply(confMats, function(x) x$byClass[names(x$byClass)=="Sensitivity"]),
+  Specificity = sapply(confMats, function(x) x$byClass[names(x$byClass)=="Specificity"]),
+  Precision = sapply(confMats, function(x) x$byClass[names(x$byClass)=="Precision"]),
+  Recall = sapply(confMats, function(x) x$byClass[names(x$byClass)=="Recall"]),
+  F1 = sapply(confMats, function(x) x$byClass[names(x$byClass)=="F1"])
+  )
+
+
+auc.summary
+```
+
+Save to csv
+
+```{r}
+write_csv(auc.summary, here("05_enet_LOOCV_performance.csv"))
+write_csv(predictions, here("05_enet_LOOCV_predictions.csv"))
+```
+
+```{r}
+sessionInfo()
+```

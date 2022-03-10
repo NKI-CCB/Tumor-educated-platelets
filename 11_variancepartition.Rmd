@@ -1,0 +1,659 @@
+---
+title: "TEP post hoc analysis: variancePartition"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    df_print: paged
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(edgeR)
+library(here)
+library(variancePartition)
+library(tidyverse)
+
+theme_set(theme_bw())
+```
+
+Focus: Variance explained by elements in the study design, using `variancePartition`. This notebook has been updated following the metadata update.
+
+## Load data
+
+### Gene expression data
+
+```{r}
+dgeAll <- readRDS(file = here("Rds/07b_dgeAll.Rds"))
+```
+
+Within the sample data, "Original" refers to the collection of samples originally received from the VUMC in December of 2018, subsetted to include only healthy controls and breast cancer patients. "blindVal" refers to the blind validation dataset collected by the NKI in 2019. Performance of classifiers trained on the blind validation set was verified by a third party in August 2020, after which the class labels were shared with all parties (i.e. the dataset is no longer blind).
+
+Original_Label refers to the data partition I developed in the summer of 2020 to build a classifier on breast cancer vs healthy controls. See notebook 01 for details. Hospital refers to the hospital from which the sample originates. Note that the NKI appears twice here, with "blindNKI" referring to the second batch produced for the blind validation set.
+
+```{r}
+dgeAll$samples %>%
+  select(hosp, group) %>%
+  table() %>%
+  addmargins()
+```
+As frequently commented upon in previous notebooks, the study design is imbalanced so that most of the cancer samples come from the NKI or MGH, and most of the control samples come from the VUMC.
+
+```{r}
+dgeAll$samples %>%
+  filter(hosp != "blindNKI") %>%
+  ggplot(aes(x = group, fill = hosp)) +
+  geom_bar() +
+  ggsci::scale_fill_igv() +
+  ggtitle("TEP samples by cancer status and hospital of origin")
+```
+
+### Elastic net features
+
+Extract them from the final model.
+
+```{r}
+model_altlambda <- readRDS(here("Rds/04_model_altlambda.Rds"))
+
+feature_extraction <- function(fit, dict = dgeAll$genes){
+  coef(fit$finalModel, fit$bestTune$lambda) %>%
+    as.matrix() %>% as.data.frame() %>%
+    slice(-1) %>% #Remove intercept
+    rownames_to_column("feature") %>%
+    rename(coef = "s1") %>%
+    filter(coef !=0) %>%
+    left_join(., dict, by = c("feature" = "ensembl_gene_id")) %>%
+    rename("ensembl_gene_id"=feature) %>%
+    arrange(desc(abs(coef)))
+}
+
+fixed_enet_feat <- feature_extraction(model_altlambda$fit)
+
+#head(fixed_enet_feat)
+print(paste("Number of elastic net features:", nrow(fixed_enet_feat)))
+```
+
+### PSO-SVM features
+
+```{r}
+pso_output <- readRDS(here("Rds/02_thromboPSO.Rds"))
+
+best.selection.pso <- paste(pso_output$lib.size,
+                            pso_output$fdr,
+                            pso_output$correlatedTranscripts,
+                            pso_output$rankedTranscripts, sep="-")
+
+particle_path <- file.path(here("pso-enhanced-thromboSeq1/outputPSO", #Originally without 1
+                           paste0(best.selection.pso,".RData")))
+
+load(particle_path) #Becomes dgeTraining
+dgeParticle <- dgeTraining #Rename to avoid namespace confusion
+rm(dgeTraining)
+
+
+#Features from PSO-SVM do not have coefficients, 
+#but they should come out of Thromboseq in a ranked order.
+
+psosvm.feat <- enframe(dgeParticle$biomarker.transcripts, "rank", "ensembl_gene_id") %>%
+  left_join(dgeParticle$genes, by = "ensembl_gene_id")
+
+print(paste("Number of PSO-SVM features:", nrow(psosvm.feat)))
+```
+
+## Variance Partition
+
+In this section, we will seek to identify sources of variance using a linear mixed effect model. This is done using the `variancePartition` package.
+
+The design formula for a mixed effect model will include age as a fixed effect (as it is a continuous variable), with hospital and cancer status as random effects (as they are categorical variables).
+
+From the manual:
+
+> "Categorical variables should (almost) always be modeled as a random effect.
+The difference between modeling a categorical variable as a fixed versus random
+effect is minimal when the sample size is large compared to the number of
+categories (i.e. levels). So variables like disease status, sex or time point will
+not be sensitive to modeling as a fixed versus random effect. However, variables
+with many categories like Individual must be modeled as a random effect in
+order to obtain statistically valid results. So to be on the safe side, categorical
+variable should be modeled as a random effect."
+
+```{r}
+#We'll change group to cancer for nicer plots
+dgeAll$samples$cancer <- dgeAll$samples$group
+
+form <- ~Age + (1|hosp) + (1|cancer)
+
+dgeAll$samples %>%
+  select(hosp, cancer) %>%
+  table()
+```
+
+Retrieve a normalized count matrix, using voom.
+Recommended is to use variables with a small number of categories that explain a substantial amount of variation
+
+```{r}
+normAll = limma::voom(edgeR::calcNormFactors(dgeAll),
+                      model.matrix( ~hosp + cancer, dgeAll$samples))
+```
+
+Fit model and extract results. 
+
+1) Fit linear mixed model on gene expression. Each entry in results is a regression model fit on a single gene.
+2) Extract variance fractions from each model fit. For each gene, returns fraction of variation attributable to each variable.
+
+Interpretation: the variance explained by each variables after correcting for all other variables
+
+This is slooooow (~75 minutes) unless you run it in parallel!
+
+If you see the "'package:stats' may not be available when loading" warning message, this is a bug in the current version of RStudio and can be safely ignored.
+
+```{r}
+doMC::registerDoMC(cores = 16)
+varPart <- suppressWarnings(
+  fitExtractVarPartModel(exprObj = normAll,
+                         formula = form,
+                         data = dgeAll$samples)
+)
+
+```
+
+After the model is fit, the variance for both fixed and random effects is computed alongside the variance of the residuals. These can then be tallied and the percentage of each returned.
+See [the original paper](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-016-1323-z) and [the manual](http://bioconductor.org/packages/release/bioc/vignettes/variancePartition/inst/doc/variancePartition.pdf) for exact formulas.
+
+```{r}
+head(varPart)
+```
+
+## Variance violin plot 
+
+### Including blind val
+
+Displays of contribution of each variable to total variance, on a per gene basis.
+Striking is that the majority of variance is attributable to residuals. This is either noise or some other factor that hasn't been well controlled for (i.e. time on the bench). The remaining signal is primarily attributable to hospital, with cancer and age making up a small percentage for most genes.
+
+```{r}
+#Sort variables (i.e. columns) by median fraction of variance explained.
+vp <- sortCols( varPart )
+
+plotVarPart( vp) +
+  ggtitle("Variance explained by elements in TEP design formula")
+```
+
+In numeric form, this is the average percentage of total variance attributable to each of the elements in the formula:
+
+```{r}
+signif(colMeans(as.matrix(vp)),2) * 100
+```
+
+### With fixed effects
+
+Does it make any difference at all if we model everything as a fixed effect?
+
+```{r}
+fixedeffects <- ~Age + hosp + cancer
+
+doMC::registerDoMC(cores = 16)
+vp_fixed <- suppressWarnings(
+  fitExtractVarPartModel(exprObj = normAll,
+                         formula = fixedeffects,
+                         data = dgeAll$samples)
+  ) %>% sortCols()
+
+plotVarPart( vp_fixed) +
+  ggtitle("Variance with fixed effects")
+
+```
+
+Fixed effect formula:
+
+```{r}
+signif(colMeans(as.matrix(vp_fixed)),2) * 100
+```
+
+Mixed effect formula:
+
+```{r}
+signif(colMeans(as.matrix(vp)),2) * 100
+```
+
+The amount of variation attributable to cancer signal decreases with a fixed effect formula.
+
+### On original dataset only
+
+How does this look on the original dataset, excluding the blind validation samples?
+
+```{r}
+dgeOriginal <- dgeAll[,dgeAll$samples$Dataset == "Original"]
+dgeOriginal$samples <- droplevels(dgeOriginal$samples)
+dgeOriginal$samples$lib.size <- colSums(dgeOriginal$counts)
+dgeOriginal$samples$hosp %>% table()
+
+normOriginal = limma::voom(edgeR::calcNormFactors(dgeOriginal),
+                           model.matrix( ~hosp + cancer, dgeOriginal$samples))
+
+#Same as above, printed for clarity
+form <- ~Age + (1|hosp) + (1|cancer)
+
+doMC::registerDoMC(cores = 16)
+varPartOriginal <- suppressWarnings(
+  fitExtractVarPartModel(exprObj = normOriginal,
+                         formula = form,
+                         data = dgeOriginal$samples)
+  )
+```
+
+```{r}
+#Sort variables (i.e. columns) by median fraction of variance explained.
+vpO <- sortCols(varPartOriginal)
+
+plotVarPart( vpO) +
+  ggtitle("TEP variance explained: Original dataset")
+```
+
+Varianceparition on original dataset only:
+
+```{r}
+signif(colMeans(as.matrix(vpO)),2) * 100
+```
+
+Whole dataset, including blind validation samples:
+
+```{r}
+signif(colMeans(as.matrix(vp)),2) * 100
+```
+
+## Genewise variance plots
+
+It's not that much of a surprise that residuals explain a large part of the dataset: we don't expect hospital, age and group to be predictive for all genes, even if we are looking at a heavily filtered subset. However, it is strange that there aren't more genes that are better explained by cancer signal.
+
+### In all samples
+
+We never have more than ~25% or so of variance explained by cancer status. Even for the top genes, the overhwleming majority of signal is captured either by hospital or left over in the residuals.
+
+```{r}
+topVarGenes <- function(eff, varpart, genes = dgeAll$genes, n = 20,
+                        returndata = F, colFUNC = ggsci::pal_igv){
+  
+  #Subset to top n and arrange decreasing
+  varpart <- as.data.frame(as.matrix(varpart)) 
+  varpart <- varpart[order(varpart[,eff,drop=T], decreasing=T),]
+  
+  #Convert ensembl IDs to gene names
+  varpart <- rownames_to_column(varpart, "ensembl_gene_id")
+  genes <- select(genes, ensembl_gene_id, symbol = hgnc_symbol) %>%
+    mutate(symbol = as.character(symbol))
+  varpart <- left_join(varpart, genes, by = "ensembl_gene_id")
+  
+  #If no gene name available, keep ensembl id
+  varpart <- varpart %>%
+    mutate(gn = ifelse(symbol == "" | is.na(symbol),
+                       ensembl_gene_id, symbol))
+  rownames(varpart) <- NULL
+  varpart <- varpart %>%
+    select(-ensembl_gene_id, -symbol) %>%
+    column_to_rownames("gn")
+  
+  #Define color scheme
+  cols <- colFUNC()(ncol(varpart))
+  names(cols) <- colnames(varpart)
+  
+  #Reorder to highlight the desired eff
+  varpart <- varpart %>% dplyr::relocate(!!as.symbol(eff))
+  
+  if(returndata){return(varpart)}
+  
+  plotPercentBars(head(varpart, n)) +
+    scale_fill_manual(values = cols)
+}
+
+
+topVarGenes(eff="cancer", varpart = vp, returndata = F) +
+  ggtitle("Top genes for cancer (All samples)")
+```
+```{r}
+topVarGenes(eff="hosp", varpart = vp, returndata = F) +
+  ggtitle("Top genes for hospital (All samples)")
+```
+
+```{r}
+topVarGenes(eff="cancer", varpart = vp) +
+  ggtitle("Top genes for cancer status (All samples)") +
+  ggsci::scale_fill_igv()
+```
+
+### Original dataset only
+
+Without blind validation samples.
+
+Cancer status: contribution to cancer is higher among the top cancer-variant genes in the original dataset, but hosp still contributes more.
+
+```{r}
+topVarGenes(eff="cancer", varpart = vpO) +
+  ggtitle("Top cancer genes: Original dataset")
+
+topVarGenes(eff="cancer", varpart = vp, returndata = F) +
+  ggtitle("Top cancer genes: Includes blind val")
+```
+
+The top hospital genes are pretty different between original dataset and the all samples version, which makes sense because we include an extra hospital in the latter.
+
+```{r}
+topVarGenes(eff="hosp", varpart = vpO) +
+  ggtitle("Top hosp genes: Original dataset")
+
+topVarGenes(eff="hosp", varpart = vp, returndata = F) +
+  ggtitle("Top hosp genes: Includes blind val")
+```
+
+### Top cancer gene
+
+Even the most cancer-associated gene isn't very well separated in the original dataset.
+
+```{r}
+##plotStratify h, include=F, eval=F
+plot_top_eff_gene <- function(eff, counts, varPartres, dge){
+  i <- which.max(varPartres[,eff, drop = T])
+  GE <- data.frame(Expression = counts$E[i,],
+                   dge$samples[,eff, drop = T])
+  colnames(GE)[2] <- eff
+  #return(GE)
+  
+  #Get the gene name and description
+  gn <- dge$genes %>% 
+    filter(ensembl_gene_id == rownames(counts)[i]) %>%
+    mutate(gn = if_else(hgnc_symbol == "" | is.na(hgnc_symbol),
+                        ensembl_gene_id,
+                        paste(hgnc_symbol, ensembl_gene_id, sep = "; "))
+    ) %>%
+    mutate(desc = str_remove_all(description, " \\[Source:.*\\]")) %>%
+    mutate(title = paste(gn, desc, sep = "; ")) %>%
+    pull(title)
+  
+  # plot expression stratified by eff
+  label <- paste0("Variance explained by ",eff, ": ", format(varPartres[,eff,drop=T][i]*100, digits=3), "%")
+  plotStratify(as.formula(paste0("Expression ~", eff)), GE, text = label, main=gn)  
+}
+
+plot_top_eff_gene(eff = "cancer", counts = normOriginal,
+                  varPartres = varPartOriginal, dge = dgeOriginal)
+```
+
+### Top hospital gene
+
+The top hospital variant gene is better separated (but not for all groups).
+
+```{r}
+plot_top_eff_gene(eff = "hosp", counts = normOriginal,
+                  varPartres = varPartOriginal, dge = dgeOriginal)
+```
+
+### Platelet genes
+
+Looking at all samples, including blind val.
+
+PF4:
+
+```{r}
+plot_gene_by_eff <- function(gene, counts, varPartres, dge){
+  
+  i <- which(rownames(varPartres) == dge$genes %>%
+               filter(hgnc_symbol == !!gene) %>% pull(ensembl_gene_id))
+  
+  GE <- data.frame(Expression = counts$E[i,], Cancer = dge$samples$cancer)
+  
+  #Get the gene name and description
+  gn <- dge$genes %>% 
+    filter(ensembl_gene_id == rownames(counts)[i]) %>%
+    mutate(gn = if_else(hgnc_symbol == "" | is.na(hgnc_symbol),
+                        ensembl_gene_id,
+                        paste(hgnc_symbol, ensembl_gene_id, sep = "; "))
+    ) %>%
+    mutate(desc = str_remove_all(description, " \\[Source:.*\\]")) %>%
+    mutate(title = paste(gn, desc, sep = "; ")) %>%
+    pull(title)
+  
+  # plot expression stratified by Cancer
+  label <- paste("Cancer status:", format(varPartres$cancer[i]*100, digits=3), "%")
+  plt1<- plotStratify( Expression ~ Cancer, GE, text = label, main=gn)
+  
+  GE <- data.frame(Expression = counts$E[i,], Hospital = dge$samples$hosp)
+  
+  #Get the gene name and description
+  gn <- dge$genes %>% 
+    filter(ensembl_gene_id == rownames(counts)[i]) %>%
+    mutate(gn = if_else(hgnc_symbol == "" | is.na(hgnc_symbol),
+                        ensembl_gene_id,
+                        paste(hgnc_symbol, ensembl_gene_id, sep = "; "))
+    ) %>%
+    mutate(desc = str_remove_all(description, " \\[Source:.*\\]")) %>%
+    mutate(title = paste(gn, desc, sep = "; ")) %>%
+    pull(title)
+  
+  # plot expression stratified by hospital
+  label <- paste("Hospital:", format(varPartres$hosp[i]*100, digits=3), "%")
+  #main <- rownames(normAll)[i]
+  plt2 <- plotStratify( Expression ~ Hospital, GE, #colorBy=NULL,
+                text=label, 
+                main=gn) 
+  
+  list(plt1, plt2)
+}
+
+plot_gene_by_eff("PF4", counts = normAll, dge = dgeAll,
+                 varPartres = varPart)
+```
+
+P-selectin (SELP):
+
+```{r}
+plot_gene_by_eff("SELP", counts = normAll, dge = dgeAll,
+                 varPartres = varPart)
+```
+
+## Variance in classifier features
+
+Let's look at the top features selected by the elastic net.
+The feature df should have a "rank" column indicating feature rank
+
+```{r}
+fixed_enet_feat <- fixed_enet_feat %>%
+  arrange(desc(abs(coef))) %>%
+  rowid_to_column("rank")
+
+head(fixed_enet_feat)
+```
+
+### Enet: Including blind val
+
+We can see that most of the variance for these genes is explained by the residuals and not by batch or cancer status.
+
+```{r}
+plot_ranked_features <- function(feat, vardf, n, colFUNC = ggsci::pal_igv){
+  
+  topfeat <- feat %>%
+    arrange(rank) %>%
+    head(20)
+  
+  #Gene name and rank as labels
+  topfeat <- topfeat %>%
+    mutate(symbol = as.character(hgnc_symbol)) %>%
+    mutate(gn = ifelse(symbol == "" | is.na(symbol),
+                       ensembl_gene_id, symbol)) %>%
+    mutate(label = paste(gn, rank, sep = " ")) %>%
+    dplyr::relocate(label, .before=description)
+  
+  #Top features in varParition results
+  vpFeat <- vardf[rownames(vardf) %in% topfeat$ensembl_gene_id,]
+  
+  #Merge with labels
+  vpFeat <- vpFeat %>%
+    rownames_to_column("ensembl_gene_id") %>%
+    left_join(., select(topfeat, ensembl_gene_id, label, rank),
+              by = "ensembl_gene_id") %>%
+    arrange(rank)
+  
+  #Sort by magnitude of coefficient
+  vpFeat <- vpFeat[match(vpFeat$ensembl_gene_id, topfeat$ensembl_gene_id),]
+  
+  #Get rid of extra column, regenerate row names
+  rownames(vpFeat) <- NULL
+  vpFeat <- vpFeat %>%
+    select(-ensembl_gene_id, -rank) %>%
+    column_to_rownames("label")
+  
+  #Keep colors consistent with rest of notebook
+  cols <- colFUNC()(ncol(vardf))
+  names(cols) <- colnames(vardf)
+  
+  #Change order
+  vpFeat <- vpFeat %>% relocate(cancer, .before = hosp)
+  
+  #Plot
+  plotPercentBars(vpFeat) +
+    scale_fill_manual(values = cols)
+}
+
+plot_ranked_features(feat = fixed_enet_feat, vardf = vp, n = 20) +
+  ggtitle("Variance within the top 20 features in the elastic net (all samples)")
+```
+
+### Enet: Original dataset only
+
+```{r}
+plot_ranked_features(feat = fixed_enet_feat, vardf = vpO, n = 20) +
+  ggtitle("Variance within the top 20 features in the elastic net (original data)")
+```
+
+### PSO-SVM: Including blind val
+
+```{r}
+plot_ranked_features(feat = psosvm.feat, vardf = vp, n = 20) +
+  ggtitle("Variance within the top 20 features in PSO-SVM (all samples)")
+```
+
+### PSO-SVM: Original dataset only
+
+```{r}
+plot_ranked_features(feat = psosvm.feat, vardf = vpO, n = 20) +
+  ggtitle("Variance within the top 20 features in PSO-SVM (original data)")
+```
+
+## Variance of potential confounders
+
+For assessing lymphocyte contamination
+
+```{r}
+cd3genes <- bind_rows(rename(psosvm.feat[psosvm.feat$hgnc_symbol %in% c("CD3D", "CD3E"),], pso.rank = rank),
+                      rename(fixed_enet_feat[fixed_enet_feat$hgnc_symbol %in% c("CD3D", "CD3E"),], enet.rank = rank))
+
+
+cd3genes <- cd3genes %>%
+  select(ensembl_gene_id, hgnc_symbol, enet.rank,pso.rank, coef) %>%
+  mutate(importance = case_when(
+    is.na(pso.rank) & !is.na(enet.rank) ~ paste("Enet rank:", enet.rank),
+    is.na(enet.rank) & !is.na(pso.rank) ~ paste("PSO rank:", pso.rank),
+    TRUE ~ paste(paste("Enet rank:", enet.rank),
+                 paste("PSO rank:", pso.rank))
+  ))
+vp_cd3 <- vp[rownames(vp) %in% cd3genes$ensembl_gene_id,]
+
+#Merge with labels
+vp_cd3 <- vp_cd3 %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  left_join(., cd3genes,
+            by = "ensembl_gene_id")
+
+#Melt
+vp_cd3 <- vp_cd3 %>%
+  select(-enet.rank, -pso.rank, -coef) %>%
+  gather(key = "covariate", -ensembl_gene_id,
+         -hgnc_symbol, -importance, value="variance")
+
+
+#Plot
+vp_cd3 %>%
+  mutate(label = paste(hgnc_symbol, importance, sep = "\n")) %>%
+  ggplot(aes(x = label, y = variance, fill = covariate))+
+  geom_bar(stat = "identity", position = "fill") +
+  ggsci::scale_fill_igv() +
+  coord_flip() +
+  ggtitle("Variance of CD3 subunits, including blind val")
+```
+
+CD3: Excluding blind val
+
+```{r}
+vpo_cd3 <- vpO[rownames(vpO) %in% cd3genes$ensembl_gene_id,]
+
+#Merge with labels
+vpo_cd3 <- vpo_cd3 %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  left_join(., cd3genes,
+            by = "ensembl_gene_id")
+
+#Melt
+vpo_cd3 <- vpo_cd3 %>%
+  select(-enet.rank, -pso.rank, -coef) %>%
+  gather(key = "covariate", -ensembl_gene_id,
+         -hgnc_symbol, -importance, value="variance")
+
+
+#Plot
+vpo_cd3 %>%
+  mutate(label = paste(hgnc_symbol, importance, sep = "\n")) %>%
+  ggplot(aes(x = label, y = variance, fill = covariate))+
+  geom_bar(stat = "identity", position = "fill") +
+  ggsci::scale_fill_igv() +
+  coord_flip() +
+  ggtitle("Variance of CD3 subunits, excluding blind val")
+```
+
+HBB
+
+```{r}
+hbbgenes <- bind_rows(rename(psosvm.feat[psosvm.feat$hgnc_symbol %in% c("HBB", "HBG2"),],
+                             pso.rank = rank),
+                      rename(fixed_enet_feat[fixed_enet_feat$hgnc_symbol %in% c("HBB", "HBG2"),],
+                             enet.rank = rank))
+
+hbbgenes <- hbbgenes %>%
+  select(ensembl_gene_id, hgnc_symbol, enet.rank,pso.rank, coef) %>%
+  mutate(importance = case_when(
+    is.na(pso.rank) & !is.na(enet.rank) ~ paste("Enet rank:", enet.rank),
+    is.na(enet.rank) & !is.na(pso.rank) ~ paste("PSO rank:", pso.rank),
+    TRUE ~ paste(paste("Enet rank:", enet.rank),
+                 paste("PSO rank:", pso.rank))
+  ))
+vp_hbb <- vp[rownames(vp) %in% hbbgenes$ensembl_gene_id,]
+
+#Merge with labels
+vp_hbb <- vp_hbb %>%
+  rownames_to_column("ensembl_gene_id") %>%
+  left_join(., hbbgenes,
+            by = "ensembl_gene_id") %>%
+  arrange(pso.rank)
+
+#Melt
+vp_hbb <- vp_hbb %>%
+  select(-coef, -enet.rank, -pso.rank) %>%
+  gather(key = "covariate", -ensembl_gene_id,
+         -hgnc_symbol, -importance, value="variance")
+
+ 
+#Plot
+vp_hbb %>%
+  mutate(label = paste(hgnc_symbol, importance, sep = "\n")) %>%
+  ggplot(aes(x = label, y = variance, fill = covariate))+
+  geom_bar(stat = "identity", position = "fill") +
+  ggsci::scale_fill_igv() +
+  coord_flip() +
+  ggtitle("Variance of hemoglobin subunits, including blind val")
+```
+
+```{r}
+sessionInfo()
+```

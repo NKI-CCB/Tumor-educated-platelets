@@ -1,0 +1,656 @@
+---
+title: "Sample Label Allocation"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 4
+    highlight: kate
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=F}
+library(edgeR)
+library(here)
+library(e1071)
+library(ggsci)
+library(ggthemes)
+library(ggpubr)
+library(tidyverse)
+theme_set(theme_bw())
+```
+
+In this notebook, we set up an age and stage-matched random series of training (40%), evaluation (30%) and validation (30%) sample labels. We have received new metadata updating age, stage, and isolationlocation (hosp). We also remove some patients for which duplicate samples were submitted.
+
+## Load data
+
+```{r}
+load(here("dataset/BrCa-dataset-201218_updatedClinicalInfo080821.RData"))
+
+#Ensure there is no more whitespace in the row names
+stopifnot(
+  length(rownames(dgeIncludedSamples$counts)[grepl(rownames(dgeIncludedSamples$counts), pattern = " ")]) == 0
+  )
+
+#Due to recoding (ex. UTRECHT -> UMCU) we should droplevels
+
+dgeIncludedSamples$samples <- droplevels(dgeIncludedSamples$samples)
+
+#ageatbiopsy causes problems
+colnames(dgeIncludedSamples$samples)[which(colnames(dgeIncludedSamples$samples)=="ageatbiopsy")] <- "Age"
+```
+
+Since receiving new metadata, the samples have already been subset to breastCancer and HC (healthy control). BRMETA is just another name for breast cancer, according to Myron.
+
+```{r}
+table(dgeIncludedSamples$samples$patientgroup,dgeIncludedSamples$samples$group)
+```
+
+Breakdown by hospital:
+
+```{r}
+table(dgeIncludedSamples$samples$isolationlocation, dgeIncludedSamples$samples$group)
+```
+
+## Data cleanup
+
+Recode "noncancer" to "healthyControl" for clarity.
+
+```{r}
+dgeHC <- dgeIncludedSamples
+rm(dgeIncludedSamples)
+
+dgeHC$samples$group <- dgeHC$samples$group %>%
+  dplyr::recode_factor("nonCancer" = "healthyControl")
+table(dgeHC$samples$patientgroup,dgeHC$samples$group)
+```
+
+Recode "n.a." to "healthyControl" in the `stage` column for clarity and consistency.
+
+```{r}
+fix_stage <- dgeHC$samples$stage %>%
+  as.character() 
+
+fix_stage[fix_stage == "n.a."] <- "healthyControl"
+fix_stage[is.na(fix_stage)] <- "healthyControl"
+
+fix_stage <- factor(fix_stage, levels = c("healthyControl", "I", "II", "III", "IV"))
+
+dgeHC$samples$stage <- fix_stage
+
+table(dgeHC$samples$stage, dgeHC$samples$group)
+
+stopifnot(nrow(filter(dgeHC$samples, is.na(stage)))==0)
+```
+
+Age should not be a character vector.
+
+```{r}
+dgeHC$samples$Age <- as.integer(dgeHC$samples$Age)
+```
+
+## Remove duplicates
+
+The dataset contains three patients that had blood drawn at both 24h and 48h.
+
+```{r}
+duplicates <- dgeHC$samples %>%
+  rownames_to_column("sample_name") %>%
+  mutate(name = as.character(name)) %>%
+  select(sample_name, name, group, isolationlocation, contains("isolated")) %>%
+  filter(duplicated(name) | duplicated(name, fromLast = T)) %>%
+  arrange(name)
+
+duplicates
+```
+
+Most of the VUMC samples have been isolated in 24h.
+
+```{r}
+dgeHC$samples %>%
+  filter(isolationlocation == "VUMC") %>%
+  mutate(totals = sum(isolatedin1h,isolatedin24h, isolatedin48h)) %>%
+  mutate(iso_time = case_when(
+    is.na(isolatedin1h) & is.na(isolatedin24h) & is.na(isolatedin48h) ~ "missing",
+    totals != 1 ~ "error",
+    isolatedin1h == 1 ~ "1h",
+    isolatedin24h == 1 ~ "24h",
+    isolatedin48h == 1 ~ "48h",
+    TRUE ~ "missing"
+  )) %>%
+  select(iso_time, group) %>% table()
+```
+
+Therefore, we discard the 48h replicates.
+
+```{r}
+discarded_dups <- duplicates %>%
+  filter(isolatedin24h != 1)
+
+ncol(dgeHC)
+dgeHC <- dgeHC[,!colnames(dgeHC) %in% discarded_dups$sample_name]
+ncol(dgeHC)
+```
+
+## QC and low count filter
+
+To ensure we know how many samples we're working with, we need to perform QC *before* we assign sample labels.
+When running the PSO-SVM, the location of these scripts is hardcoded.
+
+```{r}
+source('~/TEP/bin/thromboSeqTools_PreProcessing_2.R')
+source('~/TEP/bin/thromboSeqTools_ANOVA.R')
+source('~/TEP/bin/thromboSeqTools_PSO.R')
+```
+
+The low count filter comes before QC.
+
+>  Filters the DGE-object containing the raw data for low-abundant RNAs.
+ Args:
+   dge: DGEList outputted by the prepare.dge.object-function, contains raw count table,
+       sample info and gene info.
+   minimum.read.counts: Numeric-value containing the minimum number of gene counts to 
+       be detected in at least 90% of the samples.
+   verbose:  Whether or not to show function output.
+
+```{r}
+overwrite = F
+dir <- here("Rds")
+dgeLowCountFiltFile <- file.path(dir, "01_dgeLowCountFilt.Rds")
+
+if(!file.exists(dgeLowCountFiltFile) | overwrite == T){
+  dgeLowCountFilt <- filter.for.platelet.transcriptome(dgeHC, verbose=T)
+  saveRDS(object = dgeLowCountFilt, file = dgeLowCountFiltFile)
+} else {
+  dgeLowCountFilt <- readRDS(file = dgeLowCountFiltFile)
+}
+```
+
+QC step:
+
+> Performs the thromboSeqQC steps, that includes 
+ 1) exclusion of samples with too little RNAs detected
+ 2) leave-one-sample-out cross-correlation, i.e. excluding samples with low correlation to each other 
+ Args:
+   dge: DGEList with dataset count table, sample info and gene info tables.
+   min.number.reads.per.RNAs.detected: Minimum number of intron-spanning reads detected per transcript.
+   min.number.total.RNAs.detected: Minimum number of total transcripts at least detected per sample.
+   k.variables: Number of (expected) variables/axes in the dataset.
+   variable.to.assess: Vector containing the column names of the sample info
+                       that are potential confounding factors. Of note, for the columns
+                       'age' or 'Age' the transcripts with a correlation coefficient below
+                       and over the provided variable.thresholds are included (see Best et al.
+                       Cancer Cell 2017).
+   variable.threshold: Vector containing manually set thresholds for the potential
+                       confounding factors in the same order as for variable.to.assess.
+   ruvg.pvalue.threshold.group: Numeric-value representing the lowest p-value that should be 
+                                reached by the correlation between the counts and  any variable
+                                in order to bypass the wanted variable 'group' to be selected.
+   ruvg.pvalue.threshold.strongest.variable: Numeric-value representing the lowest p-value that should 
+                                be reached by the correlation between the counts and the specific 
+                                variable in order to this variable to be assigned to the RUVg axis.
+   training.series.only: TRUE/FALSE whether training series should be selected only for stable gene panel
+                         selection and RUV-correction.
+   leave.sample.out.threshold: Numeric-value that indicates lowest Pearson's correlation
+                               coefficient for leave-on-sample-out cross-correlation.
+   figureDir: String with directory in which figures can be outputted.
+   number.cores: Vector indicating number of computational threads to be used in parallel.
+   verbose: Whether or not to show function output.
+   
+   
+Samples by group before QC:
+
+```{r}
+table(dgeLowCountFilt$samples$group)
+```
+
+Setting the leave.seample.out.threshold to 0.3 (instead of default 0.5) is necessary if you don't want to lose a quarter of the HC samples!
+
+```{r}
+overwrite=F
+
+outFile <- file.path(dir, "01_dgeQC.Rds")
+if(!file.exists(outFile) | overwrite == T){
+  dgeQC <- thromboSeqQC(dgeLowCountFilt, k.variables = 4,
+                        variable.to.assess = c("Age","lib.size", "isolationlocation"),
+                        variable.threshold = c(0.2,0.8,0.2),
+                        leave.sample.out.threshold = 0.3)
+  saveRDS(object = dgeQC, file = outFile)
+} else {
+  dgeQC <- readRDS(outFile)
+}
+
+```
+
+Samples by group after QC:
+
+```{r}
+table(dgeQC$samples$group)
+```
+
+Samples lost:
+
+```{r}
+dgeLowCountFilt$samples %>%
+  rownames_to_column("sample_name") %>%
+  filter(!sample_name %in% colnames(dgeQC)) %>%
+  select(sample_name, group, isolationlocation, Age)
+```
+
+Rename object
+
+```{r}
+dgeFiltered <- dgeQC
+```
+
+## Age distribution
+
+Box plots of age in brca vs hc:
+
+```{r}
+dgeFiltered$samples %>%
+  ggplot(aes(x = group, y=Age, fill=group)) +
+  geom_boxplot() +
+  ggtitle("Age distribution among QC filtered samples")
+```
+
+We can see that age is relatively evenly distributed. However, there are a few more young controls than older controls.
+
+```{r}
+dgeFiltered$samples %>%
+  ggplot(aes(x=Age, fill=group)) +
+  geom_histogram(position="dodge") +
+  ggtitle("Age distribution among QC filtered samples")
+```
+
+## Sample matching by stage and age
+
+There are substantially more breastCancer than healthyControl samples after filtering:
+
+```{r}
+table(dgeFiltered$samples$group)
+```
+
+Stage of breast cancer samples:
+
+```{r}
+dgeFiltered$samples %>%
+  pull(stage) %>% table()
+```
+
+We want the stages to be divided as evenly as possible across training, evaluation and validation.
+
+Approximate numbers for each split
+
+```{r}
+approx_split = tibble(
+  split = c("Training", "Evaluation", "Validation"),
+  "stageI" = c(
+    ceiling(sum(dgeFiltered$samples$stage == "I") * 0.4),
+    rep(ceiling(sum(dgeFiltered$samples$stage == "I") * 0.3),2)
+  ),
+  "stageII" = c(
+    ceiling(sum(dgeFiltered$samples$stage == "II") * 0.4),
+    rep(ceiling(sum(dgeFiltered$samples$stage == "II") * 0.3),2)
+  ),
+  "stageIII" = c(
+    ceiling(sum(dgeFiltered$samples$stage == "III") * 0.4),
+    rep(ceiling(sum(dgeFiltered$samples$stage == "I") * 0.3),2)
+  ),
+  "stageIV" = c(
+    ceiling(sum(dgeFiltered$samples$stage == "IV") * 0.4),
+    rep(ceiling(sum(dgeFiltered$samples$stage == "IV") * 0.3),2)
+  )
+)
+
+approx_split
+```
+
+Relative approximate proportions of HCs per split:
+
+```{r}
+hc_split <- tibble(
+  split = c("Training", "Evaluation", "Validation"),
+  HC_n = c(
+    ceiling(sum(dgeFiltered$samples$group == "healthyControl") * 0.4),
+    ceiling(sum(dgeFiltered$samples$group == "healthyControl") * 0.3),
+    sum(dgeFiltered$samples$group == "healthyControl") -
+      (ceiling(sum(dgeFiltered$samples$group == "healthyControl") * 0.4) +
+      ceiling(sum(dgeFiltered$samples$group == "healthyControl") * 0.3))
+    )
+)
+
+hc_split  
+```
+
+```{r}
+sum(dgeFiltered$samples$group == "healthyControl")
+sum(dgeFiltered$samples$group == "breastCancer")
+```
+
+
+### Training samples
+
+Set aside 0.4 of each stage for training.
+
+```{r}
+set.seed(321)
+
+#Find a unique identifier
+stopifnot(length(dgeFiltered$samples$id) == length(unique(dgeFiltered$samples$id)))
+
+brca_samples <- dgeFiltered$samples
+rownames(brca_samples) <- brca_samples$id
+
+brca_training_ids <-
+  rbind(
+    tibble(
+      stage = "I",
+      id = brca_samples %>%
+        filter(group == "breastCancer" & stage == "I") %>%
+        sample_frac(size = 0.4) %>%
+        pull(id)
+    ),
+    tibble(
+      stage = "II",
+      id = brca_samples %>%
+        filter(group == "breastCancer" & stage == "II") %>%
+        sample_frac(size = 0.4) %>%
+        pull(id),
+    ),
+    tibble(
+      stage = "III",
+      id = brca_samples %>%
+        filter(group == "breastCancer" & stage == "III") %>%
+        sample_frac(size = 0.4) %>%
+        pull(id),
+    ),
+    tibble(
+      stage = "IV",
+      id = brca_samples %>%
+        filter(group == "breastCancer" & stage == "IV") %>%
+        sample_frac(size = 0.4) %>%
+        pull(id),
+    )
+  )
+#dgeFiltered$samples$Training <- NULL
+
+dgeFiltered$samples$Training <- dgeFiltered$samples$id %in% brca_training_ids$id
+
+table(dgeFiltered$samples$stage, dgeFiltered$samples$Training)
+```
+
+Age match for training.
+Because we have fewer HC samples, adjust proportions accordingly.
+
+```{r}
+set.seed(321)
+
+tInput = rbind(
+  #Pick out a proportional number of brca samples to match
+  dgeFiltered$samples %>%
+    remove_rownames() %>%
+    filter(Training == TRUE) %>%
+    sample_n(size = hc_split[hc_split$split=="Training",]$HC_n) %>%
+    column_to_rownames("id"),
+  #Combine with HC samples
+  dgeFiltered$samples %>%
+    remove_rownames() %>%
+    filter(group == "healthyControl") %>%
+    column_to_rownames("id")
+)
+traininglist <- e1071::matchControls(group ~ Age, contlabel = "healthyControl", caselabel = "breastCancer",
+                                     data = tInput
+                                     )
+
+#There should never be any overlap
+stopifnot(length(intersect(brca_training_ids$id, traininglist$controls))==0)
+
+dgeFiltered$samples$Training <- dgeFiltered$samples$id %in% c(as.character(brca_training_ids$id),
+                                                              traininglist$controls)
+table(dgeFiltered$samples$stage, dgeFiltered$samples$Training)
+```
+
+
+### Evaluation samples
+
+Set aside 0.3 of each stage for evaluation.
+
+Exclude those already chosen as training.
+
+```{r}
+set.seed(321)
+
+not_chosen <- dgeFiltered$samples %>%
+  filter(Training == F)
+
+rownames(not_chosen) <- not_chosen$id
+
+brca_eval_ids <-
+  rbind(
+    tibble(
+      stage = "I",
+      id = not_chosen %>%
+        filter(group == "breastCancer" & stage == "I") %>%
+        sample_n(size = approx_split[approx_split$split == "Evaluation", ]$stageI) %>%
+        pull(id)
+    ),
+    tibble(
+      stage = "II",
+      id = not_chosen %>%
+        filter(group == "breastCancer" & stage == "II") %>%
+        sample_n(size = approx_split[approx_split$split == "Evaluation", ]$stageII) %>%
+        pull(id),
+    ),
+    tibble(
+      stage = "III",
+      id = not_chosen %>%
+        filter(group == "breastCancer" & stage == "III") %>%
+        sample_n(size = approx_split[approx_split$split == "Evaluation", ]$stageIII) %>%
+        pull(id),
+    ),
+    tibble(
+      stage = "IV",
+      id = not_chosen %>%
+        filter(group == "breastCancer" & stage == "IV") %>%
+        sample_n(size = approx_split[approx_split$split == "Evaluation", ]$stageIV) %>%
+        pull(id),
+    )
+  )
+
+dgeFiltered$samples$Evaluation <- dgeFiltered$samples$id %in% brca_eval_ids$id
+not_chosen$Evaluation <- not_chosen$id %in% brca_eval_ids$id
+
+table(dgeFiltered$samples$stage, dgeFiltered$samples$Evaluation)
+```
+
+Age match for evaluation:
+
+```{r}
+set.seed(321)
+
+eInput = rbind(
+  #Pick out a proportional number of brca samples to match
+  dgeFiltered$samples %>%
+    remove_rownames() %>%
+    filter(Evaluation == TRUE) %>%
+    sample_n(size = hc_split[hc_split$split=="Evaluation",]$HC_n) %>%
+    column_to_rownames("id"),
+  #Combine with HC samples
+  dgeFiltered$samples %>%
+    remove_rownames() %>%
+    filter(group == "healthyControl" & Training == F) %>%
+    column_to_rownames("id")
+)
+
+
+eval_list <- e1071::matchControls(group ~ Age, contlabel = "healthyControl", caselabel = "breastCancer",
+                                  data = eInput)
+
+#There should never be any overlap
+stopifnot(length(intersect(brca_eval_ids$id, eval_list$controls))==0)
+
+dgeFiltered$samples$Evaluation <- dgeFiltered$samples$id %in% c(as.character(brca_eval_ids$id),
+                                                                eval_list$controls)
+
+table(dgeFiltered$samples$stage, dgeFiltered$samples$Evaluation)
+```
+
+### Validation samples
+
+Everything that is not already either training or evaluation belongs to the validation group.
+
+```{r}
+dgeFiltered$samples <- dgeFiltered$samples %>%
+  mutate(
+    Validation = if_else(
+      Training == F & Evaluation == F, TRUE, FALSE
+    )
+  )
+
+table(dgeFiltered$samples$stage, dgeFiltered$samples$Validation)  
+```
+
+## Summary Sample Labels
+
+There should be no overlap between the training, eval and validation sets.
+
+```{r}
+stopifnot(
+  dgeFiltered$samples %>%
+    mutate(sum = rowSums(select(dgeFiltered$samples, Training, Evaluation, Validation))) %>%
+    select(Training, Evaluation, Validation, sum) %>%
+    filter(sum > 1) %>% nrow() == 0
+)
+```
+
+Number of samples in each group:
+
+```{r}
+dgeFiltered$samples <- dgeFiltered$samples %>%
+  mutate(Label = case_when(
+    Training == T ~ "Training",
+    Evaluation == T ~ "Evaluation",
+    Validation == T ~ "Validation",    
+  )) %>%
+  mutate(Label = factor(Label,
+                        levels = c("Training", "Evaluation", "Validation"))
+         )
+
+table(dgeFiltered$samples$Label, dgeFiltered$samples$group)
+```
+
+Stages per group:
+
+```{r}
+table(dgeFiltered$samples$Label, dgeFiltered$samples$stage)
+```
+
+## Bar plot cancer vs HC
+
+Because there are fewer HC samples than brca samples, and we prioritized an even split in the training/eval groups, there are relatively few HC samples in validation.
+
+```{r}
+dgeFiltered$samples %>%
+  ggplot(aes(x = group, fill = Label)) +
+  geom_bar() +
+  ggsci::scale_fill_lancet() +
+  ggtitle("Cancer distribution across sample labels")
+
+```
+
+## Bar plot stage distribution
+
+```{r}
+dgeFiltered$samples %>%
+  ggplot(aes(x = Label, fill = stage)) +
+  geom_bar() +
+  ggsci::scale_fill_lancet() +
+  ggtitle("Stage distribution across sample labels")
+
+```
+
+## Box plot age distribution
+
+```{r}
+dgeFiltered$samples %>%
+  ggplot(aes(x = Label, y = Age, color = Label)) +
+  geom_boxplot() +
+  ggtitle("Age distribution across sample labels")
+```
+
+## Histogram age distribution
+
+```{r}
+dgeFiltered$samples %>%
+  ggplot(aes(x = Age, fill = Label)) +
+  geom_histogram() +
+  facet_wrap(~Label, nrow=3) +
+  ggtitle("Age distribution across sample labels")
+```
+
+## Bar plot hospital of origin
+
+As we have discussed extensively, most of the breast cancer samples are from two hospitals (NKI/MGH), while most of the controls are from VUMC.
+
+```{r}
+table(dgeFiltered$samples$isolationlocation, dgeFiltered$samples$group)
+```
+
+The study design is too imbalanced to compensate for this by formal matching, so no attempt has been made to do so.
+However, we visualize distribution to keep track of the issue.
+
+```{r}
+dgeFiltered$samples %>%
+  ggplot(aes(x = Label, fill = isolationlocation)) +
+  geom_bar() +
+  ggsci::scale_fill_lancet() +
+  ggtitle("Isolation location across sample labels")
+
+```
+
+## Save results
+
+Rownames get wiped with dplyr tibble operations. Regenerate them. Also keep rownames as a separate column.
+
+```{r}
+rownames(dgeFiltered$samples) <- colnames(dgeFiltered)
+dgeFiltered$samples$sample_name <- colnames(dgeFiltered)
+```
+
+There are many, many, unnecessary columns. Remove most of them.
+
+```{r}
+ncol(dgeFiltered$samples)
+dgeFiltered$samples <- dgeFiltered$samples[, -which(colnames(dgeFiltered$samples) == "clinicaldatatablename"):
+                                             -which(colnames(dgeFiltered$samples) == "HTSEQ_QC_alignment_not_unique")]
+ncol(dgeFiltered$samples)
+```
+
+Show remaining columns, ensure we have what we want (group, isolationlocation, Age, stage, training labels, etc)
+
+```{r}
+head(dgeFiltered$samples)
+```
+
+```{r}
+saveRDS(dgeFiltered, here("Rds/01_dgeFiltered.Rds"))
+```
+
+```{r}
+dgeFiltered$samples %>%
+  select(sample_name, group, id, name, stage, Age, isolationlocation, Label) %>%
+  write_csv(file = here("01_sample_labels.csv"))
+```
+
+```{r}
+sessionInfo()
+```
+
+

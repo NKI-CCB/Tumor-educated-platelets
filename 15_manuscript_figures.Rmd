@@ -1,0 +1,425 @@
+---
+title: "Manuscript figures"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    df_print: paged
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(edgeR)
+library(pROC)
+library(tidyverse)
+library(janitor)
+#![Flow chart](/home/k.moore/TEP/20210802_TEP_studydesign_flowchart.pdf)
+
+theme_set(theme_bw())
+```
+
+Either produce new figures for the manuscript, or indicate exactly where in the pipeline they can be found. The TEP manuscript is currently under revision and this notebook may change in subsequent iterations.
+
+## Figure 1: Workflow
+
+TEP workflow flowchart.
+
+Made by Marte Liefaard outside of R.
+
+```{r flowchart, echo = FALSE, message=FALSE, fig.align='center', fig.cap='TEP flowchart', out.width='0.75\\linewidth', fig.pos='H'}
+knitr::include_graphics("/home/k.moore/TEP/20210802_TEP_studydesign_flowchart.pdf")
+```
+
+## Figure 2: ROC internal validation
+
+Combined ROCs of elastic net and pso-svm on internal validation set. 
+
+See the first chart within: `4b_combine_ROCs.html`.
+
+To reproduce:
+
+```{r}
+enet <- read_csv(here("04_enet_sample_predictions.csv"))
+pso <- read_csv(here("03_pso_sample_predictions.csv"))
+
+roc_enet <- pROC::roc(response = enet$true.group,
+                      levels = c("healthyControl", "breastCancer"),
+                      predictor = enet$prob.breastCancer,
+                      direction = "<")
+roc_pso <- pROC::roc(response = pso$real.group,
+                   levels = c("healthyControl", "breastCancer"),
+                   predictor = pso$breastCancer,
+                   direction = "<")
+
+pROC::ggroc(list("elastic net" = roc_enet, "PSO-SVM" = roc_pso)) +
+  ggsci::scale_color_lancet(name = "Classifiers") +
+  ggtitle("Classifier performance on internal validation set") +
+  #Add enet AUC using same color scale
+  annotate(geom="text", x=0.25, y=0.5,
+           label=paste("AUC:",signif(pROC::auc(roc_enet),3)),
+           color=ggsci::pal_lancet()(2)[1]) +
+  #Add pso AUC using same color scale
+  annotate(geom="text", x=0.25, y=0.4,
+           label=paste("AUC:",signif(pROC::auc(roc_pso),3)),
+           color=ggsci::pal_lancet()(2)[2]) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray")
+```
+
+## Figure 3: Imbalance in study design
+
+Distribution of case/controls provided by each isolation location, WITHOUT grouping small n hospitals into an "other" category.
+
+```{r}
+dgeFiltered <- readRDS(here("Rds/01_dgeFiltered.Rds"))
+
+dgeFiltered$samples %>%
+  ggplot(aes(x = group, fill = isolationlocation)) +
+  geom_bar() +
+  scale_fill_viridis_d(name = "location") +
+  ggtitle("Distribution of cases and controls by isolation location")
+```
+
+```{r}
+dgeFiltered$samples %>%
+  select(isolationlocation, group) %>%
+  table() %>% chisq.test()
+```
+
+## Figure 4: Dimensionality and variance by hospital
+
+t-SNE plots prior to batch correction
+
+Notebooks `08_dimensionality.Rmd` and `13_batch_correction.Rmd` both have t-SNEs based on log2/TMM normalized counts. However, the latter uses the version of TMM that does not draw from validation samples, which more accurately reflects what the classifiers "see". This minor difference in normalization does not influence the conclusions drawn from the visualization.
+
+We choose the version from `13_batch_correction` both because it is more in line with classifier input, and also because it is more comparable with visualizations made after batch correction methods.
+
+### A: t-SNE by hospital
+
+This figure can be found under the headings "ComBat on training data" > "t-SNE" > "Before batch correction". It is the *first* image in the series.
+
+### B: t-SNE by case-control status
+
+This figure can be found under the headings "ComBat on training data" > "t-SNE" > "Before batch correction". It is the *second* image in the series.
+
+### C: Variance partition violin
+
+The variance partition plot can be found in `11_variancepartition.Rmd`. TODO: Decide based on narration whether this should be the version that excludes the validation data, or the version that includes it. Regardless, it should be the results of hte mixed effect model and not the fixed effect model.
+
+## Figure 5: Impact of batch correction
+
+These are found in `13_batch_correction.Rmd`
+
+### A: t-SNE by hospital after RUV correction
+
+This figure can be found under the header "RUV on training data" > "t-SNE" > "After RUV correction..."
+
+### B: t-SNE by hospital after ComBat correction
+
+Under the headers: "ComBat on training data" > "t-SNE" > "After batch correction"
+
+## Figure 6: Dimensionality by case-control status
+
+### A: Cancer status faceted by hospital
+
+Also found in `13_batch_correction.Rmd`
+
+This figure can be found under the headings "ComBat on training data" > "t-SNE" > "Before batch correction". It is the *third* image in the series.
+
+### B: Performance of NKI-only classifier on MGH & VUMC
+
+From `10_interhosp_classifier.Rmd`, under ROC downsampling > dotplot
+
+## Figure 7: blind validation performance
+
+### A: ROC for blind validation
+
+Individual ROCs have already been plotted, but here we combine them.
+
+```{r}
+enet_blindval <- readxl::read_excel(here("06_predictions.xlsx"), sheet = "enet_preds_fp")
+pso_blindval <- readxl::read_excel(here("06_predictions.xlsx"), sheet = "pso_preds_fp")
+dict <-read_csv(here("07_validated_sample_dictionary.csv"))
+
+#Add the true class labels.
+blindval <- select(dict, sample, real.group = Status_description) %>%
+  mutate(real.group = ifelse(real.group == "Case", "breastCancer", "healthyControl")) %>%
+  left_join(select(enet_blindval,
+                   sample,
+                   predicted.enet = predicted.group,
+                   prob.brca.enet = prob.breastCancer,
+                   prob.hc.enet = prob.healthyControl
+                   ),
+            ., by = "sample") %>%
+  left_join(select(pso_blindval,
+                   sample,
+                   predicted.pso = predicted.group,
+                   prob.brca.pso = prob.breastCancer,
+                   prob.hc.pso = prob.healthyControl),
+            ., by = "sample") %>%
+  relocate(real.group, .after = sample)
+
+#head(blindval)
+
+blind_roc_enet <- pROC::roc(response = blindval$real.group,
+                      levels = c("healthyControl", "breastCancer"),
+                      predictor = blindval$prob.brca.enet,
+                      direction = "<")
+blind_roc_pso <- pROC::roc(response = blindval$real.group,
+                   levels = c("healthyControl", "breastCancer"),
+                   predictor = blindval$prob.brca.pso,
+                   direction = "<")
+
+#auc(blind_roc_enet)
+#auc(blind_roc_pso)
+
+pROC::ggroc(list("elastic net" = blind_roc_enet, "PSO-SVM" = blind_roc_pso)) +
+  ggsci::scale_color_lancet(name = "Classifiers") +
+  ggtitle("Classifier performance on external validation set") +
+  #Add enet AUC using same color scale
+  annotate(geom="text", x=0.25, y=0.5,
+           label=paste("AUC:",signif(pROC::auc(blind_roc_enet),3)),
+           color=ggsci::pal_lancet()(2)[1]) +
+  #Add pso AUC using same color scale
+  annotate(geom="text", x=0.25, y=0.4,
+           label=paste("AUC:",signif(pROC::auc(blind_roc_pso),3)),
+           color=ggsci::pal_lancet()(2)[2])+
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray")
+
+```
+
+### B: Performance dotplot
+
+Found in `10_interhospital_classifiers.Rmd`
+
+## Sup Fig 1: Varpar features
+
+These are in `11_variancepartition.Rmd`
+
+### A PSO top features
+
+### B Enet top features
+
+## Sup fig 2: quality control and hemoglobin
+
+All except the ROC can be found in `14_ery_lymph_contam.Rmd`
+
+### ROC of classifiers after excluding red pellets
+
+```{r}
+erydf <- readxl::read_excel(here("dataset/third_party_val/20201217_NKI_ValSet_VU_ID_merged_redness_complete.xlsx"))
+
+#Standardize IDs
+erydf <- erydf %>% 
+  mutate(sample = str_replace(Sequence_ID, "Marte_breast", "BREAST")) %>%
+  mutate(Color = case_when(
+    Redness == 0 ~ "white",
+    Redness == 1 ~ "pink",
+    Redness == 2 ~ "red"
+  ), .after=Redness) %>%
+  mutate(Color = factor(Color, levels = c("white", "pink", "red")))
+
+head(erydf)
+```
+
+The predicted values there are from the old classifiers, prior to retraining with new metadata. Check the performance in the new classifiers without red samples (-13).
+
+```{r}
+nored_blind <- blindval %>%
+  filter(!sample %in% filter(erydf, Color== "red")$sample)
+
+nored_roc_enet <- pROC::roc(response = nored_blind$real.group,
+                      levels = c("healthyControl", "breastCancer"),
+                      predictor = nored_blind$prob.brca.enet,
+                      direction = "<")
+nored_roc_pso <- pROC::roc(response = nored_blind$real.group,
+                   levels = c("healthyControl", "breastCancer"),
+                   predictor = nored_blind$prob.brca.pso,
+                   direction = "<")
+
+pROC::ggroc(list("elastic net" = nored_roc_enet, "PSO-SVM" = nored_roc_pso)) +
+  ggsci::scale_color_lancet(name = "Classifiers") +
+  ggtitle("Classifier performance on external validation set,
+          excluding red-tinted pellets") +
+  #Add enet AUC using same color scale
+  annotate(geom="text", x=0.25, y=0.5,
+           label=paste("AUC:",signif(pROC::auc(nored_roc_enet),3)),
+           color=ggsci::pal_lancet()(2)[1]) +
+  #Add pso AUC using same color scale
+  annotate(geom="text", x=0.25, y=0.4,
+           label=paste("AUC:",signif(pROC::auc(nored_roc_pso),3)),
+           color=ggsci::pal_lancet()(2)[2]) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray")
+```
+
+```{r}
+pROC::ci.auc(nored_roc_enet)
+pROC::ci.auc(nored_roc_pso)
+```
+
+## Sup fig 3: QC lymphocyte contamination
+
+Also all from `14_ery_lymph_contam.Rmd`
+
+## Sup fig 4
+
+Can be foun in `10_interhosp_classifiers.Rmd` under the header "Original dataset cross-validation, revisited".
+
+## Table 1
+
+To recalculate the totals as Marte originally put them in the table, we'll need to split controls and cases.
+
+She had column percentages for stage, but row percentages when reporting total cases and controls.
+
+```{r}
+dgeFiltered$samples %>%
+  filter(stage != "healthyControl") %>%
+  droplevels() %>%
+  janitor::tabyl(stage, Label) %>%
+  janitor::adorn_totals(where = c("row", "col")) %>%
+  janitor::adorn_percentages(denominator = "col") %>%
+  janitor::adorn_pct_formatting(digits = 1) %>% 
+  janitor::adorn_ns(position = "front") %>%
+  janitor::adorn_title()
+
+```
+
+```{r}
+dgeFiltered$samples %>%
+  janitor::tabyl(group, Label) %>%
+  janitor::adorn_totals(where = c("row", "col")) %>%
+  janitor::adorn_percentages(denominator = "row") %>%
+  janitor::adorn_pct_formatting(digits = 1) %>% 
+  janitor::adorn_ns(position = "front") %>%
+  janitor::adorn_title()
+
+```
+
+Get the age info for cases and controls.
+
+```{r}
+dgeFiltered$samples %>%
+  group_by(group) %>%
+  summarise(mean_age = round(mean(Age),2),
+            median_age = median(Age),
+            iqr_lower = quantile(Age, 0.25),
+            iqr_upper = quantile(Age, 0.75),
+            .groups = "drop")
+
+```
+
+```{r}
+
+dgeFiltered$samples %>%
+  group_by(group, Label) %>%
+  summarise(#mean_age = round(mean(Age),2),
+            median_age = median(Age),
+            iqr_lower = quantile(Age, 0.25),
+            iqr_upper = quantile(Age, 0.75),
+            .groups = "drop")
+
+```
+
+## Table 2
+
+```{r}
+read_csv(here("04_enet_vs_psosvm_summary.csv"))
+```
+
+
+```{r}
+read_csv(here("04_enet_vs_psosvm_detailed.csv"))
+```
+
+## Table 3
+
+```{r}
+dgeAll <- readRDS(here("Rds/07b_dgeAll.Rds"))
+
+dgeBlind <- dgeAll[,dgeAll$samples$Dataset == "blindVal"]
+dgeBlind$samples <- droplevels(dgeBlind$samples)
+
+```
+
+```{r}
+dgeBlind$samples %>%
+  janitor::tabyl(group) %>%
+  janitor::adorn_totals() %>%
+  janitor::adorn_pct_formatting(digits = 1)
+
+```
+
+```{r}
+dgeBlind$samples %>%
+  filter(stage != "healthyControl") %>%
+  droplevels() %>%
+  janitor::tabyl(stage) %>%
+  janitor::adorn_totals() %>%
+  janitor::adorn_pct_formatting(digits = 1)
+
+```
+
+```{r}
+dgeBlind$samples %>%
+  group_by(group) %>%
+  summarise(mean_age = round(mean(Age),2),
+            median_age = median(Age),
+            iqr_lower = quantile(Age, 0.25),
+            iqr_upper = quantile(Age, 0.75),
+            .groups = "drop")
+
+```
+
+## Sup tbl 1
+
+```{r}
+read_csv(here("13_batch_summary.csv")) %>%
+  filter(validation != "blind validation")
+```
+
+## Sup tbl 2
+
+```{r}
+read_csv(here("10_interhospital_performance_summary.csv"))
+```
+
+## Sup tbl 3
+
+```{r}
+read_csv(here("07_blind_val_performance.csv")) %>%
+  filter(Run != "original blinded")
+```
+
+## Complete metadata table
+
+```{r}
+metadata_tbl <- dgeAll$samples %>%
+  rename(Internal_Validation_Label = Original_Label,
+         External_Validation_Label = Label,
+         isoloc_agg = hosp) %>%
+  relocate(isoloc_agg, .after = isolationlocation) %>%
+  mutate(isolationlocation = str_remove(isolationlocation, "blind"),
+         isoloc_agg = str_remove(isoloc_agg, "blind"),
+         Dataset = case_when(
+           Dataset == "Original" ~ "internal validation",
+           Dataset == "blindVal" ~ "external validation",
+           TRUE ~ "Fixme"
+         )) %>%
+  select(-norm.factors)
+
+stopifnot(nrow(filter(metadata_tbl, Dataset == "Fixme"))==0)
+
+head(metadata_tbl)
+```
+
+```{r}
+write_csv(metadata_tbl, here("15_metadata_table.csv"))
+```
+
+```{r}
+sessionInfo()
+```

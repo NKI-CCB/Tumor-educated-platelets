@@ -1,0 +1,2026 @@
+---
+title: "TEP post hoc analysis: differential expression"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    df_print: paged
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(edgeR)
+#library(RColorBrewer)
+library(here)
+library(ggsci)
+library(ggthemes)
+library(ggpubr)
+library(openxlsx)
+library(GO.db)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(KEGGREST)
+library(ComplexHeatmap)
+library(DESeq2)
+library(tidyverse)
+
+theme_set(theme_bw())
+```
+
+## Introduction
+
+In this notebook, we will continue exploring possible explanations for the poor performance of the TEP classifiers on the blind validation set. In addition to the analyses already performed, this notebook will focus on differential expression analysis with `edgeR`, especially within the batch effect.
+
+The DGEList that contains all the data:
+
+```{r}
+dgeAll <- readRDS(file = here("Rds/07b_dgeAll.Rds"))
+```
+
+Overview of sample data:
+
+```{r}
+head(dgeAll$samples)
+```
+
+Within the sample data, "Original" refers to the collection of samples originally received from the VUMC in December of 2018, subsetted to include only healthy controls and breast cancer patients. "blindVal" refers to the blind validation dataset collected by the NKI in 2019. Performance of classifiers trained on the blind validation set was verified by a third party in August 2020, after which the class labels were shared with all parties (i.e. the dataset is no longer blind).
+
+Original_Label refers to the data partition I developed in the summer of 2020 to build a classifier on breast cancer vs healthy controls. See notebook 01 for details. `isolationlocation` refers to the hospital from which the sample originates. Note that the NKI appears twice here, with "blindNKI" referring to the second batch produced for the blind validation set.
+
+```{r}
+dgeAll$samples %>%
+  select(isolationlocation, group) %>%
+  table() %>%
+  addmargins()
+```
+
+Since some hospitals contributed few samples (AMC, VUMC, VIENNA), they have been grouped together into an "other" category.
+
+```{r}
+dgeAll$samples %>%
+  select(hosp, group) %>%
+  table() %>%
+  addmargins()
+```
+
+As frequently commented upon in previous notebooks, the study design is imbalanced so that most of the cancer samples come from the NKI or MGH, and most of the control samples come from the VUMC.
+
+```{r}
+dgeAll$samples %>%
+  filter(hosp != "blindNKI") %>%
+  ggplot(aes(x = group, fill = hosp)) +
+  geom_bar() +
+  ggsci::scale_fill_igv() +
+  ggtitle("TEP samples by cancer status and hospital of origin")
+```
+
+We will also need the entrez IDs for pathway analysis later, which is not included in `dgeAll$genes`.
+
+```{r}
+# Return the Ensembl IDs for a set of genes
+entrez <- AnnotationDbi::select(org.Hs.eg.db, # database
+                                keys = rownames(dgeAll),  # data to use for retrieval
+                                columns = c("ENSEMBL", "ENTREZID"
+                                            #,"GENENAME"
+                                            ), # information to retreive for given data
+                                keytype = "ENSEMBL") # type of data given in 'keys' argument
+
+
+#Remove duplicates: Many of these are NAs
+#For the rest, not much else we can do about multi-mapping
+entrez <- entrez[!duplicated(entrez$ENTREZID),]
+entrez <- entrez[!duplicated(entrez$ENSEMBL),]
+#nrow(dgeAll$genes)
+#nrow(entrez)
+
+entrez <- left_join(dgeAll$genes, entrez,
+                    by=c("ensembl_gene_id" = "ENSEMBL"))
+entrez <- as.data.frame(entrez)
+
+rownames(entrez) <- entrez$ensembl_gene_id
+
+dgeAll$genes <- entrez
+
+head(dgeAll$genes)
+```
+
+## Differential expression
+
+For a standard `edgeR` diffex pipeline, apply TMM normalization.
+Outside of a machine-learning context, we are not concerned with manually selecting the reference sample or excluding training samples from the TMM calculation.
+
+```{r}
+dgeAll <- calcNormFactors(dgeAll, method = "TMM") 
+```
+
+Although it will be tough to compensate for batch effects that are so imbalanced, we will try by including hospital in the design formula.
+
+### Design matrix
+
+The original NKI samples and the blind validation samples from the NKI will be modelled as two separate groups.
+
+```{r}
+dgeAll$samples$hosp %>% levels()
+dgeAll$samples$group %>% levels()
+```
+```{r}
+design <- model.matrix(~Age + hosp + group, data = dgeAll$samples) 
+
+colnames(design) <- str_remove_all(str_remove_all(colnames(design), "hosp"),"group")
+design[1:2,]
+```
+
+### Fit model 
+ 
+```{r}
+#A wrapper function to perform all steps up until the final test
+#We omit the final test to allow for greater flexibility with contrasts later on
+
+fitmydiffex <- function(y, design, method = "QL", show.time = T){
+  
+  stopifnot(method %in% c("QL", "LRT"))
+  
+  start <- Sys.time()
+  
+  #Normalize if it hasn't been done already
+  if(all(y$samples$norm.factors == 1)){
+    y <- calcNormFactors(y, method = "TMM") 
+  }
+  
+  #Estimate dispersions
+  y <- estimateDisp(y,design,robust = T)
+  
+  #Fit model
+  if(method == "QL"){
+    fit <- glmQLFit(y, design)
+    method <- "QL"
+  } else {
+    fit <- glmFit(y,design)
+    method <- "LRT"
+  }
+  
+  #Slow part ends here
+  end <- Sys.time()
+  if(show.time){print(end-start)}
+  
+  #Return results
+  list(dge = y,
+       fit = fit,
+       method = method)
+  
+  
+}
+
+fit.group <- fitmydiffex(dgeAll, design = design)
+
+```
+
+### Dispersion plots
+
+```{r}
+plotBCV(fit.group$dge)
+```
+
+```{r}
+plotQLDisp(fit.group$fit)
+```
+
+### Diffex genes: Cancer status
+
+Using the QL framework, how many genes are differentially expressed in cancer vs healthy control?
+
+```{r}
+#colnames(design)[7] #"groupbreastCancer"
+cancer.res <- glmQLFTest(fit.group$fit, coef=ncol(design))
+
+decideTestsDGE(cancer.res) %>% summary()
+```
+
+What are the top expressed genes in cancer vs healthy control?
+
+```{r}
+topTags(cancer.res)
+```
+
+Filter out the pseudogenes and those without hgnc symbols/entrez IDs and look again:
+
+```{r}
+topTags(cancer.res, n = Inf) %>%
+  as.data.frame() %>%
+  filter(!str_detect(description, "pseudogene")) %>%
+  filter(hgnc_symbol != "" & !is.na(ENTREZID)) %>%
+  filter(FDR <= 0.05) %>% 
+  head(30) %>% remove_rownames()
+```
+
+#### Pathways: Cancer status
+
+Gene ontology analysis for biological process (BP) and KEGG pathway analysis.
+
+```{r}
+get_pathways <- function(res, ont = "BP", threshold = 0.05,
+                         verbose = T){
+  
+  #goana.DGELRT defines its own universe
+  goanna <- goana(res, species = "Hs", geneid = "ENTREZID") 
+  go <- goanna %>%
+    topGO(ont = ont, number = Inf) %>%
+    mutate(fdr.up = p.adjust(P.Up, method = "fdr"),
+           fdr.down = p.adjust(P.Down, method = "fdr"))
+  
+  #Add the go terms
+  goanna <- as.data.frame(goanna) %>%
+    rownames_to_column("GOID") %>%
+    dplyr::select(GOID, Term)
+  go <- left_join(go, goanna, by = "Term")
+  
+  nup <- go %>% filter(fdr.up <= !!threshold) %>% nrow()
+  ndown <- go %>% filter(fdr.down <= !!threshold) %>% nrow()
+  
+  if(verbose == T){
+    print(paste("Significantly upregulated GO", ont, "terms:", nup))
+    print(paste("Significantly downregulated GO", ont, "terms:", ndown))
+  }
+  
+  kegg <- kegga(res, species = "Hs", geneid = "ENTREZID") %>%
+    topKEGG(number = Inf) %>%
+    mutate(fdr.up = p.adjust(P.Up, method = "fdr"),
+           fdr.down = p.adjust(P.Down, method = "fdr"))
+  
+  keggup <- kegg %>% filter(fdr.up <= !!threshold) %>% nrow()
+  keggdown <- kegg %>% filter(fdr.down <= !!threshold) %>% nrow()
+  
+  if(verbose == T){
+    print(paste("Significantly upregulated KEGG pathways:", keggup))
+    print(paste("Significantly downregulated KEGG pathways:", keggdown))
+  }  
+  
+  list(go = go,
+       kegg = kegg)
+}
+
+path.cancer.res <- get_pathways(cancer.res)
+```
+
+The top upregulated GO terms associated with cancer include many platelet and wound processes.
+This does suggest that the classifier is picking up on endogenous platelet RNA and not RNA taken up in the tumor microenvironment.
+
+```{r}
+path.cancer.res$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+```
+
+Visualize the platelet degranulation pathway.
+
+```{r}
+platelet.go <- path.cancer.res$go %>%
+  filter(Term == "platelet degranulation") %>%
+  pull(GOID)
+
+#Entrez gene ids
+Rkeys(org.Hs.egGO2ALLEGS) <- platelet.go
+
+stopifnot(all(row.names(fit.group$fit) == row.names(fit.group$dge$genes)))
+
+#ind <- ids2indices(as.list(org.Hs.egGO2ALLEGS), #entrez gene ids
+#                   fit.group$dge$genes$ENTREZID)
+#fry(fit.group$dge, index=ind, design=design, contrast=colnames(design)[7])
+
+ind <- fit.group$dge$genes$ENTREZID %in% as.data.frame(org.Hs.egGO2ALLEGS)$gene_id
+barcodeplot(cancer.res$table$logFC, index = ind,
+            labels = c("healthyControl", "breastCancer"),
+            main = path.cancer.res$go %>%
+              filter(Term == "platelet degranulation") %>%
+              mutate(title = paste(Term, GOID, sep=", ")) %>%
+              pull(title)
+  )
+```
+
+Downregulated GO terms are an eclectic blend, but immune- and metabolism-related processes stand out.
+RNA processing also features here.
+
+```{r}
+path.cancer.res$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+KEGG pathways can give us a more condensed view than GO terms. By far the most enriched is platelet activation.
+
+```{r}
+path.cancer.res$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+```
+
+Once again we see immune and RNA related pathways in the downregulated group.
+
+```{r}
+path.cancer.res$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+### Diffex genes: Hospital
+
+Note: There is no "pathways" subheader for hospital, as those analyses will be included in each pairwise comparison.
+
+Recall that these are the elements of the design matrix.
+The original NKI samples and the new ones from the blind validation set are modelled separately.
+
+```{r}
+colnames(design)
+```
+
+We can fit an ANOVA-like test for batch effect among all hospitals by selecting multiple coefficients.
+
+This will account for both age and cancer status, so this should narrow down the batch effect as much as possible.
+
+```{r}
+#Column names corresponding to hospital of origin
+colnames(design)[3:6]
+
+hosp.anova.res <- glmQLFTest(fit.group$fit, coef=3:6)
+
+decideTestsDGE(hosp.anova.res) %>% summary()
+```
+
+Basically everything is significant if we do this, which is very bad.
+
+Let's set up some contrasts to look at specific hospitals.
+
+```{r}
+hosp.contrasts <- makeContrasts(
+  blindvsNKI = blindNKI-NKI,
+  NKIvsMGH = NKI-MGH,
+  NKIvsVUMC = NKI-VUMC,
+  VUMCvsMGH = VUMC-MGH,
+  blindvsMGH = blindNKI-MGH,
+  blindvsVUMC = blindNKI-VUMC,
+  levels = design
+)
+
+hosp.contrasts
+
+#Not true because (Intercept) is now Intercept
+#stopifnot(all(colnames(fit.group$fit$coefficients) == rownames(hosp.contrasts)))
+```
+
+Apply the QLF test to each of the comparisons in the contrast and retrieve the number of DEGs in each.
+Most contrasts have a lot of DEGs, which is not good but also not a surprise.
+
+```{r}
+hosp.res <- lapply(colnames(hosp.contrasts),
+                   function(x) glmQLFTest(fit.group$fit,
+                                        contrast = hosp.contrasts[,x]))
+
+names(hosp.res) <- colnames(hosp.contrasts)
+
+lapply(hosp.res, function(x) summary(decideTests(x)))
+```
+
+Retrieve the most interesting columns for all the comparisons:
+
+```{r}
+hosp.res.df <- lapply(hosp.res, function(x) topTags(x, n = Inf))
+hosp.res.df <- lapply(hosp.res.df,
+                      function(x) as.data.frame(x) %>%
+                        dplyr::select(hgnc_symbol, FDR, logFC:PValue,
+                                      description, ENTREZID, ensembl_gene_id)
+                      %>% as.data.frame() #No tibbles
+)
+
+```
+
+Set up an empty list for bundling pathway analyses together
+
+```{r}
+paths.hosp <- vector(mode = "list", length = length(hosp.res))
+names(paths.hosp) <- names(hosp.res)
+path.ind <- 0
+```
+
+#### Blind validation vs original NKI
+
+Set the analysis index.
+
+```{r}
+path.ind <- path.ind + 1
+thispath <- names(paths.hosp)[path.ind]
+thispath
+```
+
+The blindval group is quite balanced, the NKI group contains mostly cancers.
+
+```{r}
+dgeAll$samples %>%
+  filter(hosp %in% c("blindNKI", "NKI")) %>%
+  select(group, hosp) %>% 
+  droplevels() %>% table()
+```
+
+Top 30 most diffex genes.
+
+There are at least a couple of "obvious cancer genes" in here (SDCCAG8 up, NKTR up, TPT1 down, FUS up, NBPF10 up).
+
+```{r}
+hosp.res.df[[thispath]] %>% head(30)
+```
+
+```{r}
+paths.hosp[[thispath]] <- get_pathways(hosp.res[[thispath]])
+```
+
+Upregulated GO terms include RNA and metabolic processes.
+
+```{r}
+paths.hosp[[thispath]]$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+```
+
+Kegg terms are similar.
+
+```{r}
+paths.hosp[[thispath]]$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05)
+```
+
+Downregulated GO terms and KEGG pathways include platelet and wound healing. This is notable because both processes were upregulated when comparing cancer vs healthy controls.
+
+```{r}
+paths.hosp[[thispath]]$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+paths.hosp[[thispath]]$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+This is the barcode plot for platelet degranulation in the blind validation set vs original NKI samples.
+
+```{r}
+barcodeplot(hosp.res$blindvsNKI$table$logFC, index = ind,
+            labels = c("NKI", "blind"),
+            main = path.cancer.res$go %>%
+              filter(Term == "platelet degranulation") %>%
+              mutate(title = paste(Term, GOID, sep=", ")) %>%
+              pull(title)
+  )
+```
+
+By contrast, this is how it looked for cancer vs non-cancer.
+
+```{r}
+barcodeplot(cancer.res$table$logFC, index = ind,
+            labels = c("healthyControl", "breastCancer"),
+            main = path.cancer.res$go %>%
+              filter(Term == "platelet degranulation") %>%
+              mutate(title = paste(Term, GOID, sep=", ")) %>%
+              pull(title)
+  )
+```
+
+#### NKI vs MGH
+
+Set the analysis index.
+
+```{r}
+path.ind <- path.ind + 1
+thispath <- names(paths.hosp)[path.ind]
+thispath
+```
+
+The MGH cohort is entirely cancers, the NKI group contains mostly cancers but with some controls.
+
+```{r}
+dgeAll$samples %>%
+  filter(hosp %in% c("NKI", "MGH")) %>%
+  select(group, hosp) %>% 
+  droplevels() %>% table()
+```
+
+Top 30 most diffex genes.
+
+```{r}
+hosp.res.df[[thispath]] %>% head(30)
+```
+
+Pathway results:
+
+```{r}
+paths.hosp[[thispath]] <- get_pathways(hosp.res[[thispath]])
+```
+
+Like the previous comparison, we see a lot of RNA processing in the upregulated list when comparing original NKI samples to MGH.
+
+```{r}
+paths.hosp[[thispath]]$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.hosp[[thispath]]$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+```
+
+Also like the previous comparison, we see platelet activation is downregulated in original NKI to MGH.
+
+```{r}
+paths.hosp[[thispath]]$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+paths.hosp[[thispath]]$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+#### NKI vs VUMC
+
+Set the analysis index.
+
+```{r}
+path.ind <- path.ind + 1
+thispath <- names(paths.hosp)[path.ind]
+thispath
+```
+
+VUMC is almost all controls, NKI is a mix but is skewed towards cancers.
+
+```{r}
+dgeAll$samples %>%
+  filter(hosp %in% c("NKI", "VUMC")) %>%
+  select(group, hosp) %>% 
+  droplevels() %>% table()
+```
+
+Top 30 most diffex genes.
+
+```{r}
+hosp.res.df[[thispath]] %>% head(30)
+```
+
+```{r}
+paths.hosp[[thispath]] <- get_pathways(hosp.res[[thispath]])
+```
+
+```{r}
+paths.hosp[[thispath]]$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.hosp[[thispath]]$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+```
+
+Just like the previous comparisons, wound healing and platelet processes are downregulated.
+
+```{r}
+paths.hosp[[thispath]]$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+paths.hosp[[thispath]]$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+#### VUMC vs MGH
+
+Set the analysis index.
+
+```{r}
+path.ind <- path.ind + 1
+thispath <- names(paths.hosp)[path.ind]
+thispath
+```
+
+This is almost entirely confounded with case-control status.
+
+```{r}
+dgeAll$samples %>%
+  filter(hosp %in% c("VUMC", "MGH")) %>%
+  select(hosp, group) %>% 
+  droplevels() %>% table()
+```
+
+Top 30 most diffex genes.
+
+```{r}
+hosp.res.df[[thispath]] %>% head(30)
+```
+
+Pathway results:
+
+```{r}
+paths.hosp[[thispath]] <- get_pathways(hosp.res[[thispath]])
+```
+
+Translational regulation and rRNA prevail among the upregulated pathways in VUMC vs MGH. Platelet activation is included among KEGG pathways.
+
+```{r}
+paths.hosp[[thispath]]$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.hosp[[thispath]]$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+```
+
+Some immune processes among the results: but this may always be cancer vs healthy signal.
+
+```{r}
+paths.hosp[[thispath]]$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+paths.hosp[[thispath]]$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+#### Blind validation vs MGH
+
+Set the analysis index.
+
+```{r}
+path.ind <- path.ind + 1
+thispath <- names(paths.hosp)[path.ind]
+thispath
+```
+
+```{r}
+dgeAll$samples %>%
+  filter(hosp %in% c("blindNKI", "MGH")) %>%
+  select(group, hosp) %>% 
+  droplevels() %>% table()
+```
+
+Top 30 most diffex genes.
+
+```{r}
+hosp.res.df[[thispath]] %>% head(30)
+```
+
+```{r}
+paths.hosp[[thispath]] <- get_pathways(hosp.res[[thispath]])
+```
+
+More RNA processing stuff here (blind validation vs MGH).
+
+```{r}
+paths.hosp[[thispath]]$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.hosp[[thispath]]$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+```
+
+Platelet processes again (blind validation vs MGH).
+
+```{r}
+paths.hosp[[thispath]]$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+paths.hosp[[thispath]]$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+#### Blind validation vs VUMC
+
+Set the analysis index.
+
+```{r}
+path.ind <- path.ind + 1
+thispath <- names(paths.hosp)[path.ind]
+thispath
+```
+
+```{r}
+dgeAll$samples %>%
+  filter(hosp %in% c("blindNKI", "VUMC")) %>%
+  select(group, hosp) %>% 
+  droplevels() %>% table()
+```
+
+Top 30 most diffex genes.
+
+```{r}
+hosp.res.df[[thispath]] %>% head(30)
+```
+
+```{r}
+paths.hosp[[thispath]] <- get_pathways(hosp.res[[thispath]])
+```
+
+RNA processes prevail in blind validation vs VUMC.
+
+```{r}
+paths.hosp[[thispath]]$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.hosp[[thispath]]$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+```
+
+Like before, platelet activation is downregulated in blind validation vs VUMC.
+
+```{r}
+paths.hosp[[thispath]]$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+paths.hosp[[thispath]]$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+#### Group comparisons
+
+##### NKI and blindval vs all
+
+A few additional contrasts to supplement the pairwise comparisons above.
+
+```{r groupcontrasts}
+groupContrasts <- makeContrasts(
+  blindvsall = blindNKI-(NKI+VUMC+MGH)/3,
+  NKIvsOriginalHosps = NKI-(VUMC+MGH)/2,
+  levels = design
+)
+
+qlf.blindvsall <- glmQLFTest(fit.group$fit, contrast=groupContrasts[,"blindvsall"])
+paths.blindvsall <- get_pathways(qlf.blindvsall, verbose=F)
+
+qlf.NKIvsHosps <- glmQLFTest(fit.group$fit, contrast=groupContrasts[,"NKIvsOriginalHosps"])
+paths.NKIvsHosps <- get_pathways(qlf.NKIvsHosps, verbose=F)
+
+```
+
+For blind val:
+
+```{r}
+#Pathway results for blind NKI vs all other hospitals
+
+paths.blindvsall$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.blindvsall$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+paths.blindvsall$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.blindvsall$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+For NKI:
+
+```{r}
+#Pathway results for NKI vs other hospitals in original dataset:
+paths.NKIvsHosps$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.NKIvsHosps$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+paths.NKIvsHosps$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.NKIvsHosps$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+##### VUMC vs all
+
+```{r groupcontrasts2}
+contrastsVUMC <- makeContrasts(
+  VUMCvsall = VUMC-(NKI+blindNKI+MGH)/3,
+  VUMCvsOriginalHosps = VUMC-(NKI+MGH)/2,
+  levels = design
+)
+
+qlf.VUMCvsall <- glmQLFTest(fit.group$fit, contrast=contrastsVUMC[,"VUMCvsall"])
+paths.VUMCvsall <- get_pathways(qlf.VUMCvsall, verbose=F)
+
+qlf.VUMCvsHosps <- glmQLFTest(fit.group$fit, contrast=contrastsVUMC[,"VUMCvsOriginalHosps"])
+paths.VUMCvsHosps <- get_pathways(qlf.VUMCvsHosps, verbose=F)
+
+```
+
+Pathway results for VUMC vs all other hospitals
+
+```{r}
+paths.VUMCvsall$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.VUMCvsall$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+paths.VUMCvsall$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.VUMCvsall$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+Vs original dataset
+
+```{r}
+paths.VUMCvsHosps$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.VUMCvsHosps$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+paths.VUMCvsHosps$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.VUMCvsHosps$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+##### MGH vs all
+
+
+```{r groupcontrasts3}
+contrastsMGH <- makeContrasts(
+  MGHvsall = MGH-(NKI+blindNKI+VUMC)/3,
+  MGHvsOriginalHosps = MGH-(NKI+VUMC)/2,
+  levels = design
+)
+
+qlf.MGHvsall <- glmQLFTest(fit.group$fit, contrast=contrastsMGH[,"MGHvsall"])
+paths.MGHvsall <- get_pathways(qlf.MGHvsall, verbose=F)
+
+qlf.MGHvsHosps <- glmQLFTest(fit.group$fit, contrast=contrastsMGH[,"MGHvsOriginalHosps"])
+paths.MGHvsHosps <- get_pathways(qlf.MGHvsHosps, verbose=F)
+
+```
+
+Pathway results for MGH vs all other hospitals
+
+```{r}
+paths.MGHvsall$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.MGHvsall$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+paths.MGHvsall$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.MGHvsall$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+Vs original dataset
+
+```{r}
+paths.MGHvsHosps$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.MGHvsHosps$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+paths.MGHvsHosps$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+paths.MGHvsHosps$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+## Diffex: Healthy controls
+
+Since case-control status is so confounded by isolation location, what if we subset down to just controls?
+
+```{r}
+dgeControls <- dgeAll[, dgeAll$samples$group == "healthyControl"]
+dgeControls$samples <- droplevels(dgeControls$samples)
+dgeControls$samples %>%
+  select(hosp, group) %>% table()
+```
+
+Create design formula:
+
+```{r}
+designControls <- model.matrix(~Age + hosp, data = dgeControls$samples) 
+colnames(designControls) <- str_remove_all(colnames(designControls), "hosp")
+designControls[1:2,]
+```
+
+Normalize and fit model:
+
+```{r}
+dgeControls <- calcNormFactors(dgeControls, method = "TMM")
+
+fit.controls <- fitmydiffex(dgeControls, design = designControls)
+```
+
+Set up contrasts:
+
+```{r}
+control.contrasts <- makeContrasts(
+  blindvsNKI = blindNKI-NKI,
+  VUMCvsNKI = VUMC-NKI,
+  VUMCvsBlind = VUMC-blindNKI,
+  levels = designControls
+)
+
+control.contrasts
+```
+
+Apply the QLF test to each of the comparisons in the contrast and retrieve the number of DEGs in each.
+The VUMC looks like the outlier here (not weird, given that the other two are batches from the same hosp).
+
+```{r}
+controls.res <- lapply(colnames(control.contrasts),
+                   function(x) glmQLFTest(fit.controls$fit,
+                                        contrast = control.contrasts[,x]))
+
+names(controls.res) <- colnames(control.contrasts)
+
+lapply(controls.res, function(x) summary(decideTests(x)))
+```
+
+Retrieve the most interesting columns for all the comparisons:
+
+```{r}
+control.res.df <- lapply(controls.res, function(x) topTags(x, n = Inf))
+control.res.df <- lapply(control.res.df,
+                      function(x) as.data.frame(x) %>%
+                        dplyr::select(hgnc_symbol, FDR, logFC:PValue,
+                                      description, ENTREZID, ensembl_gene_id)
+                      %>% as.data.frame() #No tibbles
+)
+
+```
+
+Set up an empty list for bundling pathway analyses together
+
+```{r}
+path.controls <- vector(mode = "list", length = length(controls.res))
+names(path.controls) <- names(controls.res)
+path.ind <- 0
+```
+
+### Controls: Blindval vs NKI
+
+Set the analysis index.
+
+```{r}
+path.ind <- path.ind + 1
+thispath <- names(path.controls)[path.ind]
+thispath
+```
+
+Top 30 most diffex genes.
+
+```{r}
+control.res.df[[thispath]] %>% head(30)
+```
+
+```{r}
+path.controls[[thispath]] <- get_pathways(controls.res[[thispath]])
+```
+
+Mostly RNA and virus.
+
+```{r}
+path.controls[[thispath]]$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+path.controls[[thispath]]$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05)
+```
+
+Wounding and secretion dominant.
+
+```{r}
+path.controls[[thispath]]$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+path.controls[[thispath]]$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+### Controls: VUMC vs NKI
+
+Set the analysis index.
+
+```{r}
+path.ind <- path.ind + 1
+thispath <- names(path.controls)[path.ind]
+thispath
+```
+
+Top 30 most diffex genes.
+
+```{r}
+control.res.df[[thispath]] %>% head(30)
+```
+
+```{r}
+path.controls[[thispath]] <- get_pathways(controls.res[[thispath]])
+```
+
+Platelet activation is up in VUMC vs NKI.
+
+```{r}
+path.controls[[thispath]]$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+path.controls[[thispath]]$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05)
+```
+
+Metabolism and splicing is down.
+
+```{r}
+path.controls[[thispath]]$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+path.controls[[thispath]]$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+### Controls: VUMC vs blindval
+
+Set the analysis index.
+
+```{r}
+path.ind <- path.ind + 1
+thispath <- names(path.controls)[path.ind]
+thispath
+```
+
+Top 30 most diffex genes.
+
+```{r}
+control.res.df[[thispath]] %>% head(30)
+```
+
+Pathways:
+
+```{r}
+path.controls[[thispath]] <- get_pathways(controls.res[[thispath]])
+```
+
+VUMC is upregulated relative to blind val for platelet activity.
+
+```{r}
+path.controls[[thispath]]$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+path.controls[[thispath]]$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05)
+```
+
+RNA and metabolism is downregulated.
+
+```{r}
+path.controls[[thispath]]$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+path.controls[[thispath]]$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+## Diffex: Cancer
+
+Since case-control status is so confounded by isolation location, what if we subset down to just cases?
+
+```{r}
+dgeCancer <- dgeAll[, dgeAll$samples$group == "breastCancer"]
+dgeCancer$samples <- droplevels(dgeCancer$samples)
+dgeCancer$samples %>%
+  select(hosp, group) %>% table()
+```
+
+Since the VUMC only provides 6 cases, exclude them.
+
+```{r}
+dgeCancer <- dgeCancer[, dgeCancer$samples$hosp != "VUMC"]
+dgeCancer$samples <- droplevels(dgeCancer$samples)
+dgeCancer$samples %>%
+  select(hosp, group) %>% table()
+```
+
+Create design formula:
+
+```{r}
+#No "other" group: to set up contrasts, use a formula without an intercept
+designCancer <- model.matrix(~0 + Age + hosp, data = dgeCancer$samples) 
+colnames(designCancer) <- str_remove_all(colnames(designCancer), "hosp")
+designCancer[1:2,]
+```
+
+Normalize and fit model:
+
+```{r}
+dgeCancer <- calcNormFactors(dgeCancer, method = "TMM")
+
+fit.cancer <- fitmydiffex(dgeCancer, design = designCancer)
+```
+
+Set up contrasts:
+
+```{r}
+cancer.contrasts <- makeContrasts(
+  blindvsNKI = blindNKI-NKI,
+  MGHvsNKI = MGH-NKI,
+  MGHvsBlind = MGH-blindNKI,
+  levels = designCancer
+)
+
+cancer.contrasts
+```
+
+Apply the QLF test to each of the comparisons in the contrast and retrieve the number of DEGs in each.
+
+```{r}
+cancer.res <- lapply(colnames(cancer.contrasts),
+                   function(x) glmQLFTest(fit.cancer$fit,
+                                        contrast = cancer.contrasts[,x]))
+
+names(cancer.res) <- colnames(cancer.contrasts)
+
+lapply(cancer.res, function(x) summary(decideTests(x)))
+```
+
+Retrieve the most interesting columns for all the comparisons:
+
+```{r}
+cancer.res.df <- lapply(cancer.res, function(x) topTags(x, n = Inf))
+cancer.res.df <- lapply(cancer.res.df,
+                      function(x) as.data.frame(x) %>%
+                        dplyr::select(hgnc_symbol, FDR, logFC:PValue,
+                                      description, ENTREZID, ensembl_gene_id)
+                      %>% as.data.frame() #No tibbles
+)
+
+```
+
+Set up an empty list for bundling pathway analyses together
+
+```{r}
+path.cancer <- vector(mode = "list", length = length(cancer.res))
+names(path.cancer) <- names(cancer.res)
+path.ind <- 0
+```
+
+### Cancer: Blindval vs NKI
+
+Set the analysis index.
+
+```{r}
+path.ind <- path.ind + 1
+thispath <- names(path.cancer)[path.ind]
+thispath
+```
+
+Top 30 most diffex genes.
+
+```{r}
+cancer.res.df[[thispath]] %>% head(30)
+```
+
+```{r}
+path.cancer[[thispath]] <- get_pathways(cancer.res[[thispath]])
+```
+
+Mostly RNA and virus, just like the controls for NKI vs blindval.
+
+```{r}
+path.cancer[[thispath]]$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+path.cancer[[thispath]]$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05)
+```
+
+Here platelet activity comes up, unlike controls.
+
+```{r}
+path.cancer[[thispath]]$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+path.cancer[[thispath]]$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+### Cancer: MGH vs NKI
+
+Set the analysis index.
+
+```{r}
+path.ind <- path.ind + 1
+thispath <- names(path.cancer)[path.ind]
+thispath
+```
+
+Top 30 most diffex genes.
+
+```{r}
+cancer.res.df[[thispath]] %>% head(30)
+```
+
+```{r}
+path.cancer[[thispath]] <- get_pathways(cancer.res[[thispath]])
+```
+
+Wound healing and platelet activation... again.
+
+```{r}
+path.cancer[[thispath]]$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+path.cancer[[thispath]]$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05)
+```
+
+RNA processing, again.
+
+```{r}
+path.cancer[[thispath]]$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+path.cancer[[thispath]]$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+### Cancer: MGH vs blindval
+
+Set the analysis index.
+
+```{r}
+path.ind <- path.ind + 1
+thispath <- names(path.cancer)[path.ind]
+thispath
+```
+
+Top 30 most diffex genes.
+
+```{r}
+cancer.res.df[[thispath]] %>% head(30)
+```
+
+```{r}
+path.cancer[[thispath]] <- get_pathways(cancer.res[[thispath]])
+```
+
+Platelet activation!
+
+```{r}
+path.cancer[[thispath]]$go %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05) %>%
+  head(30)
+
+path.cancer[[thispath]]$kegg %>%
+  arrange(fdr.up) %>%
+  filter(fdr.up <= 0.05)
+```
+
+RNA processing!
+
+```{r}
+path.cancer[[thispath]]$go %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+
+path.cancer[[thispath]]$kegg %>%
+  arrange(fdr.down) %>%
+  filter(fdr.down <= 0.05) %>%
+  head(30)
+```
+
+## Platelet activity
+
+Our differential expression analysis shows that platelet activation is differentially expressed both in cancer vs healthy controls and in the new blind validation set vs virtually every other hospital.
+
+For hospital of origin, platelet activtity is downregulated in original NKI samples vs samples from other hospitals, and even more downregulated in the blind validation set vs the rest.
+
+```{r}
+#GO
+lapply(paths.hosp, function(x) x$go %>%
+         arrange(fdr.up) %>%
+         rowid_to_column("rank.up") %>%
+         arrange(fdr.down) %>%
+         rowid_to_column("rank.down") %>%
+         filter(str_detect(Term, "platelet")) %>%
+         filter(fdr.up <= 0.05 | fdr.down <= 0.05)) %>%
+  bind_rows(.id = "comparison") %>%
+  relocate(rank.up,rank.down, .after= comparison) %>%
+  mutate(sig.up = fdr.up < 0.05,
+         sig.down = fdr.down < 0.05,
+         .after = comparison)
+
+#KEGG
+lapply(paths.hosp, function(x) x$kegg %>%
+         arrange(fdr.up) %>%
+         rowid_to_column("rank.up") %>%
+         arrange(fdr.down) %>%
+         rowid_to_column("rank.down") %>%
+         mutate(Pathway = tolower(Pathway)) %>%
+         filter(str_detect(Pathway, "platelet")) %>%
+         filter(fdr.up <= 0.05 | fdr.down <= 0.05)) %>%
+  bind_rows(.id = "comparison") %>%
+  relocate(rank.up,rank.down, .after= comparison) %>%
+  mutate(sig.up = fdr.up < 0.05,
+         sig.down = fdr.down < 0.05,
+         .after = comparison)
+```
+
+It also appears in comparisons between only controls.
+Down in blindval vs NKI (less dramatic).
+Up in VUMC vs NKI or blindval (very dramatic)
+
+```{r}
+#GO
+lapply(path.controls, function(x) x$go %>%
+         arrange(fdr.up) %>%
+         rowid_to_column("rank.up") %>%
+         arrange(fdr.down) %>%
+         rowid_to_column("rank.down") %>%
+         filter(str_detect(Term, "platelet")) %>%
+         filter(fdr.up <= 0.05 | fdr.down <= 0.05)) %>%
+  bind_rows(.id = "comparison") %>%
+  relocate(rank.up,rank.down, .after= comparison) %>%
+  mutate(sig.up = fdr.up < 0.05,
+         sig.down = fdr.down < 0.05,
+         .after = comparison)
+
+lapply(path.controls, function(x) x$kegg %>%
+         arrange(fdr.up) %>%
+         rowid_to_column("rank.up") %>%
+         arrange(fdr.down) %>%
+         rowid_to_column("rank.down") %>%
+         mutate(Pathway = tolower(Pathway)) %>%
+         filter(str_detect(Pathway, "platelet")) %>%
+         filter(fdr.up <= 0.05 | fdr.down <= 0.05)) %>%
+  bind_rows(.id = "comparison") %>%
+  relocate(rank.up,rank.down, .after= comparison) %>%
+  mutate(sig.up = fdr.up < 0.05,
+         sig.down = fdr.down < 0.05,
+         .after = comparison)
+```
+
+For cancer, down in blind vs NKI.
+Up in MGH vs NKI or blind val.
+
+```{r}
+lapply(path.cancer, function(x) x$go %>%
+         arrange(fdr.up) %>%
+         rowid_to_column("rank.up") %>%
+         arrange(fdr.down) %>%
+         rowid_to_column("rank.down") %>%
+         filter(str_detect(Term, "platelet")) %>%
+         filter(fdr.up <= 0.05 | fdr.down <= 0.05)) %>%
+  bind_rows(.id = "comparison") %>%
+  relocate(rank.up,rank.down, .after= comparison) %>%
+  mutate(sig.up = fdr.up < 0.05,
+         sig.down = fdr.down < 0.05,
+         .after = comparison)
+
+lapply(path.cancer, function(x) x$kegg %>%
+         arrange(fdr.up) %>%
+         rowid_to_column("rank.up") %>%
+         arrange(fdr.down) %>%
+         rowid_to_column("rank.down") %>%
+         mutate(Pathway = tolower(Pathway)) %>%
+         filter(str_detect(Pathway, "platelet")) %>%
+         filter(fdr.up <= 0.05 | fdr.down <= 0.05)) %>%
+  bind_rows(.id = "comparison") %>%
+  relocate(rank.up,rank.down, .after= comparison) %>%
+  mutate(sig.up = fdr.up < 0.05,
+         sig.down = fdr.down < 0.05,
+         .after = comparison)
+```
+
+Something with the way the samples are gathered may be responsible for causing/preventing platelet degranulation?
+Which genes are these?
+
+```{r}
+platelet.go <- paths.hosp[["blindvsNKI"]]$go %>%
+  filter(Term %in% c(
+    "platelet degranulation",
+    "platelet aggregation",
+    "platelet activation" 
+  ))
+
+#platelet.go
+
+#Retrieves entrez IDs
+#Some GO terms are absent
+#Rkeys(org.Hs.egGO2ALLEGS) <- platelet.go
+#Use biomart instead
+
+# define biomart object
+martFile <- here("Rds/martFile.Rds")
+if(!file.exists(martFile)){
+  mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl",
+                host = "http://www.ensembl.org")
+  saveRDS(mart, martFile)
+} else {
+  mart <- readRDS(martFile)
+}
+
+
+# Will retrieve children
+platelet.go.genes <- getBM(attributes = c("ensembl_gene_id", "go_id", "name_1006"),
+                           filters = "go", values = platelet.go$GOID,
+                           mart = mart) %>% filter(go_id %in% platelet.go$GOID)
+
+```
+
+Better to retrieve the KEGG genes since it's very consistently ranked as the top KEGG term.
+
+```{r}
+keggdf <- keggList("hsa", database = "pathway") %>%
+  enframe()
+
+filter(keggdf, str_detect(value, "Platelet"))$name
+filter(keggdf, str_detect(value, "Platelet"))$value
+plkegg <- KEGGREST::keggGet(filter(keggdf, str_detect(value, "Platelet"))$name)
+
+plkeggdf <- tibble(
+  ENTREZID = plkegg[[1]]$GENE[seq(1,length(plkegg[[1]]$GENE),2)],
+  gene = plkegg[[1]]$GENE[seq(0,length(plkegg[[1]]$GENE),2)]
+)
+#nrow(plkeggdf)
+#6915 	TBXA2R
+#dgeAll$genes %>%
+#  filter(ENTREZID == "6915")
+
+dgePlatelets <- dgeAll[dgeAll$genes$ENTREZID %in% plkeggdf$ENTREZID, ]
+print(paste("Platelet genes:", nrow(dgePlatelets$genes)))
+
+ind <- fit.group$dge$genes$ensembl_gene_id %in% rownames(dgePlatelets)
+```
+
+### Relevance as features
+
+```{r}
+model_altlambda <- readRDS(here("Rds/04_model_altlambda.Rds"))
+
+feature_extraction <- function(fit, dict = dgeAll$genes){
+   coef(fit$finalModel, fit$bestTune$lambda) %>%
+    as.matrix() %>% as.data.frame() %>%
+    slice(-1) %>% #Remove intercept
+    rownames_to_column("feature") %>%
+    rename(coef = "s1") %>%
+    filter(coef !=0) %>%
+    left_join(., dict, by = c("feature" = "ensembl_gene_id")) %>%
+    rename("ensembl_gene_id"=feature) %>%
+    arrange(desc(abs(coef))) %>%
+    rowid_to_column("rank")
+}
+
+fixed_enet_feat <- feature_extraction(model_altlambda$fit)
+
+print(paste("Number of elastic net features:", nrow(fixed_enet_feat)))
+```
+
+Which of those genes were features in the elastic net?
+
+```{r}
+rownames(dgePlatelets) %in% fixed_enet_feat$ensembl_gene_id %>%
+  table()
+
+fixed_enet_feat <- fixed_enet_feat %>%
+  mutate(isPlatelet = ensembl_gene_id %in% dgePlatelets$genes$ensembl_gene_id) 
+```
+
+Not many were selected as features, so perhaps this isn't the culprit for our bad classifier after all.
+
+Are the ones that were selected important?
+
+```{r}
+fixed_enet_feat %>%
+  filter(isPlatelet)
+```
+
+A few were relatively important, but not many.
+
+What about the particle swarm?
+
+```{r}
+pso_output <- readRDS(here("Rds/02_thromboPSO.Rds"))
+
+best.selection.pso <- paste(pso_output$lib.size,
+                            pso_output$fdr,
+                            pso_output$correlatedTranscripts,
+                            pso_output$rankedTranscripts, sep="-")
+
+particle_path <- file.path(here(
+                           "pso-enhanced-thromboSeq1/outputPSO", #Originally without 1
+                           paste0(best.selection.pso,".RData")))
+
+load(particle_path) #Becomes dgeTraining
+dgeParticle <- dgeTraining #Rename to avoid namespace confusion
+rm(dgeTraining)
+
+
+#Features from PSO-SVM do not have coefficients, 
+#but they should come out of Thromboseq in a ranked order.
+
+psosvm.feat <- enframe(dgeParticle$biomarker.transcripts, "rank", "ensembl_gene_id") %>%
+  left_join(dgeParticle$genes, by = "ensembl_gene_id")
+
+print(paste("Number of PSO-SVM features:", nrow(psosvm.feat)))
+
+rownames(dgePlatelets) %in% psosvm.feat$ensembl_gene_id %>% table()
+```
+
+More of the platelet genes acted as particle swarm features, but since the PSO-SVM used far more features, this doesn't mean much.
+
+### Barcode plots
+
+In particular, we want to see these pathways plotted in the blind validation set vs everything else, and NKI vs other hospitals in the original dataset.
+
+For blind validation vs original dataset, a clear overall decrease, though there are some upregulated genes as well.
+
+```{r}
+paths.blindvsall$kegg %>%
+              filter(fdr.down <= 0.05) %>%
+              filter(str_detect(Pathway , "Platelet"))
+```
+
+#### Blindval vs rest
+
+```{r}
+barcodeplot(qlf.blindvsall$table$logFC, index = ind,
+            labels = c("original dataset", "blind validation"),
+            main = "Plaletet activation by dataset"
+  )
+```
+
+For NKI samples vs all other hospitals in the original dataset, same story.
+
+```{r}
+paths.NKIvsHosps$kegg %>%
+              filter(fdr.down <= 0.05) %>%
+              filter(str_detect(Pathway , "Platelet"))
+```
+
+#### NKI vs rest
+
+```{r}
+barcodeplot(qlf.NKIvsHosps$table$logFC, index = ind,
+            labels = c("Other hospitals", "NKI"),
+            main = "Plaletet activation: NKI vs other hospitals"
+  )
+```
+
+#### NKI vs MGH
+
+Top depleted hit.
+
+```{r}
+paths.hosp$NKIvsMGH$kegg %>%
+  arrange(fdr.down) %>% head()
+```
+
+Flip the direction of the barcode so that it's MGH vs NKI
+
+```{r}
+barcodeplot(-hosp.res.df$NKIvsMGH$logFC,
+            index = hosp.res.df$NKIvsMGH$ensembl_gene_id %in% rownames(dgePlatelets),
+            labels = c("NKI", "MGH"),
+            main = paste("Plaletet activation: MGH vs NKI")
+  )
+```
+
+#### NKI vs VUMC
+
+Top depleted hit.
+
+```{r}
+paths.hosp$NKIvsVUMC$kegg %>%
+  arrange(fdr.down) %>% head()
+```
+
+Flip the direction of the barcode so that it's VUMC vs NKI
+
+```{r}
+barcodeplot(-hosp.res.df$NKIvsVUMC$logFC,
+            index = hosp.res.df$NKIvsVUMC$ensembl_gene_id %in% rownames(dgePlatelets),
+            labels = c("NKI", "VUMC"),
+            main = "Plaletet activation: VUMC vs NKI"
+  )
+```
+
+#### VUMC vs MGH
+
+Not the top hit, but still highly enriched and statistically significant.
+
+```{r}
+paths.hosp$VUMCvsMGH$kegg %>%
+  arrange(fdr.up) %>% head()
+```
+
+```{r}
+barcodeplot(hosp.res.df$VUMCvsMGH$logFC,
+            index = hosp.res.df$VUMCvsMGH$ensembl_gene_id %in% rownames(dgePlatelets),
+            labels = c("MGH", "VUMC"),
+            main = "Plaletet activation: VUMC vs MGH"
+  )
+```
+
+#### Cancer: MGH vs NKI
+
+Top enriched hit.
+
+```{r}
+path.cancer$MGHvsNKI$kegg %>%
+  arrange(fdr.up) %>% head()
+```
+
+```{r}
+barcodeplot(cancer.res.df$MGHvsNKI$logFC,
+            index = cancer.res.df$MGHvsNKI$ensembl_gene_id %in% rownames(dgePlatelets),
+            labels = c("NKI", "MGH"),
+            main = "Plaletet activation: MGH vs NKI (cancer only)"
+  )
+```
+
+#### Control: VUMC vs NKI
+
+Top enriched hit.
+
+```{r}
+path.controls$VUMCvsNKI$kegg %>%
+  arrange(fdr.up) %>% head()
+```
+
+
+```{r}
+barcodeplot(control.res.df$VUMCvsNKI$logFC,
+            index = control.res.df$VUMCvsNKI$ensembl_gene_id %in% rownames(dgePlatelets),
+            labels = c("NKI", "VUMC"),
+            main = "Plaletet activation: VUMC vs NKI (controls only)"
+  )
+```
+
+### Heatmaps
+
+#### General platelet activity
+
+
+##### All samples
+
+```{r}
+#Define colors
+hmap_colors = list(
+  group = c(healthyControl="white", breastCancer="black"),
+  hosp = ggsci::pal_lancet()(length(unique(dgePlatelets$samples$hosp))),
+  Dataset = ggsci::pal_jco()(length(unique(dgePlatelets$samples$Dataset)))
+)
+names(hmap_colors$hosp) = unique(dgePlatelets$samples$hosp)
+names(hmap_colors$Dataset) = unique(dgePlatelets$samples$Dataset)
+
+#Heatmap plotting
+dge_heatmap = function(dge,
+                       title="Heatmap",
+                       top_vars = c("Dataset","hosp"),
+                       top_colors = list(Dataset = hmap_colors$Dataset,
+                                         hosp = hmap_colors$hosp),
+                       bottom_vars = c("group"),
+                       bottom_colors = list(group = hmap_colors$group),
+                       legend_title = NULL,
+                       row_scale = F,
+                       row_size = 8, col_size = 8,
+                       show_col_names = F, show_row_names = T,
+                       debug = F, ...){
+  
+  
+  #Normalized count matrix
+  mat = edgeR::cpm(edgeR::calcNormFactors(dge),
+                   log = T, normalized.lib.sizes = T)
+  
+  #Row scale settings
+  if (row_scale==T){
+    mat = t(scale(t(mat)))
+  }
+  #Change legend according to whether input is scaled
+  if (row_scale==T){
+    hlp = list(title="rowscaled logcpm")
+  } else {
+    hlp = list(title="logcpm counts")
+  }
+  
+  #Replace ensembl IDs with gene names, or keep ensembl ID if gene names are absent
+  genes <- dge$genes
+  genes <- genes %>%
+    dplyr::mutate(gene_name = as.character(hgnc_symbol)) %>%
+    dplyr::mutate(
+      label = ifelse(gene_name == "" | is.na(gene_name),
+                    ensembl_gene_id, gene_name)
+      )
+  
+  #return(genes)
+  rownames(mat) <- genes$label
+  
+  sampledata <- as.data.frame(dge$samples)
+  
+  #Heatmap annotation
+  ann_top = sampledata[,top_vars, drop=F]
+  
+  #Top column annotation
+  colTop <- ComplexHeatmap::HeatmapAnnotation(
+    df=ann_top, which="col",
+    col = top_colors
+    #annotation_legend_param = list(list(title = legend_title))
+  )
+  #return(colTop)
+  
+  #Bottom column annotation
+  ann_bottom = sampledata[,bottom_vars, drop=F]
+  colBottom <- ComplexHeatmap::HeatmapAnnotation(
+    df=ann_bottom, which="col", col = bottom_colors
+    )
+  
+  #Debug: ensure we have the number of genes we expect to have
+  if(debug){print(paste("N genes in heatmap:", nrow(mat)))}
+  
+  #Draw the heatmap
+  ComplexHeatmap::Heatmap(mat,
+          top_annotation = colTop,
+          bottom_annotation = colBottom,
+          #left_annotation = rowAnno,
+          heatmap_legend_param = hlp,
+          show_row_names = show_row_names,
+          show_column_names = show_col_names,
+          cluster_rows = T,
+          row_names_gp = gpar(fontsize = row_size),
+          column_names_gp = gpar(fontsize = col_size),
+          column_title = title,
+          ...)
+}
+
+set.seed(123)
+
+#dge_heatmap(dgePlatelets, show_row_names = F,
+#            title = "Platetet Degranulation & Activation",
+#            row_scale = F, column_km = 2, row_km = 2)
+
+dge_heatmap(dgePlatelets, show_row_names = F,
+            title = "Platetet Activation",
+            row_scale = T, column_km = 2, row_km = 2,
+            debug=T)
+
+#dgePlatelets$samples
+```
+
+##### Original dataset
+
+Let's see what this would look like if we visualized only the original dataset.
+
+```{r}
+dgePlatelets2 <- dgePlatelets[,dgePlatelets$samples$Dataset == "Original"]
+dgePlatelets2$samples <- droplevels(dgePlatelets2$samples)
+
+#Define colors
+hmap_colors = list(
+  group = c(healthyControl="white", breastCancer="black"),
+  hosp = ggsci::pal_lancet()(length(unique(dgePlatelets2$samples$hosp)))
+)
+names(hmap_colors$hosp) = unique(dgePlatelets2$samples$hosp)
+
+set.seed(123)
+suppressMessages(
+  dge_heatmap(dgePlatelets2, show_row_names = F,
+            top_vars = "hosp", 
+            top_colors = list(hosp = hmap_colors$hosp), 
+            title = "Platetet Activity: Original dataset",
+            row_scale = T,
+            column_km = 2, row_km = 2
+            )
+  )
+```
+
+##### Healthy controls
+
+Including blindval.
+
+```{r}
+dgeControlPlatelets <- dgePlatelets[,colnames(dgePlatelets) %in% colnames(dgeControls)]
+dgeControlPlatelets$samples <- droplevels(dgeControlPlatelets$samples)
+#table(dgeControlPlatelets$samples$hosp, dgeControlPlatelets$samples$group)
+
+#Define colors
+hmap_colors = list(
+  group = c(healthyControl="lightgray", breastCancer="black"),
+  hosp = ggsci::pal_lancet()(length(unique(dgeControlPlatelets$samples$hosp)))
+)
+names(hmap_colors$hosp) = unique(dgeControlPlatelets$samples$hosp)
+
+set.seed(123)
+dge_heatmap(dgeControlPlatelets,
+            top_vars = "hosp", show_row_names = F,
+            top_colors = list(hosp = hmap_colors$hosp), 
+            title = "Platetet Activity: Controls only",
+            row_scale = T, column_km = 2, row_km = 2,
+            debug = T)
+```
+
+Excluding blindval and other.
+
+```{r}
+dgeControlPlatelets <- dgeControlPlatelets[,!dgeControlPlatelets$samples$hosp %in% c("blindNKI", "other")]
+dgeControlPlatelets$samples <- droplevels(dgeControlPlatelets$samples)
+#table(dgeControlPlatelets$samples$hosp, dgeControlPlatelets$samples$group)
+
+#Define colors
+hmap_colors = list(
+  group = c(healthyControl="lightgray", breastCancer="black"),
+  hosp = ggsci::pal_lancet()(length(unique(dgeControlPlatelets$samples$hosp)))
+)
+names(hmap_colors$hosp) = unique(dgeControlPlatelets$samples$hosp)
+
+set.seed(123)
+dge_heatmap(dgeControlPlatelets,
+            top_vars = "hosp", show_row_names = F,
+            top_colors = list(hosp = hmap_colors$hosp), 
+            title = "Platetet Activity: Controls only",
+            row_scale = T, column_km = 2, row_km = 2,
+            debug = T)
+```
+
+##### Cancer
+
+```{r}
+dgeCancerPlatelets <- dgePlatelets[,colnames(dgePlatelets) %in% colnames(dgeCancer)]
+dgeCancerPlatelets$samples <- droplevels(dgeCancerPlatelets$samples)
+#table(dgeCancerPlatelets$samples$hosp, dgeCancerPlatelets$samples$group)
+
+#Define colors
+hmap_colors = list(
+  group = c(healthyControl="lightgray", breastCancer="black"),
+  hosp = ggsci::pal_lancet()(length(unique(dgeCancerPlatelets$samples$hosp)))
+)
+names(hmap_colors$hosp) = unique(dgeCancerPlatelets$samples$hosp)
+
+set.seed(123)
+dge_heatmap(dgeCancerPlatelets,
+            top_vars = "hosp", show_row_names = F,
+            top_colors = list(hosp = hmap_colors$hosp), 
+            title = "Platetet Activity: Cancer only",
+            row_scale = T, column_km = 2, row_km = 2,
+            debug = T)
+```
+
+Excluding blindval
+
+```{r}
+dgeCancerPlatelets <- dgeCancerPlatelets[,!dgeCancerPlatelets$samples$hosp %in% c("blindNKI", "other")]
+#table(dgeCancerPlatelets$samples$hosp, dgeCancerPlatelets$samples$group)
+
+#Define colors
+hmap_colors = list(
+  group = c(healthyControl="lightgray", breastCancer="black"),
+  hosp = ggsci::pal_lancet()(length(unique(dgeCancerPlatelets$samples$hosp)))
+)
+names(hmap_colors$hosp) = unique(dgeCancerPlatelets$samples$hosp)
+
+set.seed(123)
+dge_heatmap(dgeCancerPlatelets,
+            top_vars = "hosp", show_row_names = F,
+            top_colors = list(hosp = hmap_colors$hosp), 
+            title = "Platetet Activity: Cancer only",
+            row_scale = T, column_km = 2, row_km = 2,
+            debug = T)
+```
+
+```{r}
+sessionInfo()
+```

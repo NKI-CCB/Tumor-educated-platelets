@@ -1,0 +1,97 @@
+---
+title: "Enet and PSO-SVM ROCs"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    df_print: paged
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(pROC)
+library(tidyverse)
+
+theme_set(theme_bw())
+```
+
+We've already shown ROCs for the enet and pso-svm individually; now let's show them together.
+
+## Load data
+
+```{r}
+enet <- read_csv(here("04_enet_sample_predictions.csv"))
+
+head(enet)
+```
+
+```{r}
+pso <- read_csv(here("03_pso_sample_predictions.csv"))
+
+head(pso)
+```
+
+## Combined ROCs
+
+Remember:
+
+>with direction = '>', observations are positive when they are smaller than or equal (<=) to the threshold. With direction = '<', observations are positive when they are greater than or equal (>=) to the threshold.
+
+```{r}
+roc_enet <- pROC::roc(response = enet$true.group,
+                      levels = c("healthyControl", "breastCancer"),
+                      predictor = enet$prob.breastCancer,
+                      direction = "<")
+roc_pso <- pROC::roc(response = pso$real.group,
+                   levels = c("healthyControl", "breastCancer"),
+                   predictor = pso$breastCancer,
+                   direction = "<")
+
+pROC::ggroc(list("elastic net" = roc_enet, "PSO-SVM" = roc_pso)) +
+  ggsci::scale_color_lancet(name = "Classifiers") +
+  ggtitle("Classifier performance on internal validation set") +
+  #Add enet AUC using same color scale
+  annotate(geom="text", x=0.25, y=0.5,
+           label=paste("AUC:",signif(pROC::auc(roc_enet),3)),
+           color=ggsci::pal_lancet()(2)[1]) +
+  #Add pso AUC using same color scale
+  annotate(geom="text", x=0.25, y=0.4,
+           label=paste("AUC:",signif(pROC::auc(roc_pso),3)),
+           color=ggsci::pal_lancet()(2)[2])
+```
+
+Without ggplot, it's easier to extract the AUCs, but color and positioning are more difficult to adjust.
+
+```{r}
+plot2rocs <- function(roc1, roc2, title){
+  plot.roc(roc1,
+           main = title, 
+           percent=TRUE,
+           #ci = TRUE,  #Finite xlim glitch 
+           print.auc = TRUE,
+           asp = NA)
+  plot.roc(roc2, print.auc=T, add=T)
+  
+}
+
+plot2rocs(roc1 = pROC::roc(response = enet$true.group,
+                   levels = c("healthyControl", "breastCancer"),
+                   predictor = enet$prob.breastCancer,
+                   direction = "<"),
+          roc2 = pROC::roc(response = pso$real.group,
+                   levels = c("healthyControl", "breastCancer"),
+                   predictor = pso$breastCancer,
+                   direction = "<"),
+          title="Classifier performance on internal validation set")
+```
+
+```{r}
+sessionInfo()
+```
+

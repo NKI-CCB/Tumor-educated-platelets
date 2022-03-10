@@ -1,0 +1,352 @@
+---
+title: "Feature plots"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    df_print: paged
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(edgeR)
+library(here)
+library(ComplexHeatmap)
+library(tidyverse)
+library(ggthemes)
+library(ggsci)
+
+theme_set(theme_bw())
+```
+
+Plot expression of top ranked elastic net and PSO-SVM features as box plots or as heatmaps. 
+
+## Load data
+
+Expression & metadata for both original dataset and blind validation:
+
+```{r}
+dgeAll <- readRDS(file = here("Rds/07b_dgeAll.Rds"))
+```
+
+Create subsets for original data and blind val:
+
+```{r}
+dgeOriginal <- dgeAll[,dgeAll$samples$Dataset == "Original"]
+dgeOriginal$samples <- droplevels(dgeOriginal$samples)
+
+dgeBlindVal <- dgeAll[,dgeAll$samples$Dataset == "blindVal"]
+dgeBlindVal$samples <- droplevels(dgeBlindVal$samples)
+```
+
+Elastic net model, from which we extract the features
+
+```{r}
+model_altlambda <- readRDS(here("Rds/04_model_altlambda.Rds"))
+
+feature_extraction <- function(fit, dict = dgeAll$genes){
+   coef(fit$finalModel, fit$bestTune$lambda) %>%
+    as.matrix() %>% as.data.frame() %>%
+    slice(-1) %>% #Remove intercept
+    rownames_to_column("feature") %>%
+    rename(coef = "1") %>%
+    filter(coef !=0) %>%
+    left_join(., dict, by = c("feature" = "ensembl_gene_id")) %>%
+    rename("ensembl_gene_id"=feature) %>%
+    arrange(desc(abs(coef))) %>%
+    rowid_to_column("rank")
+}
+
+enet_feat <- feature_extraction(model_altlambda$fit)
+
+head(enet_feat)
+```
+
+Total number of elastic net features in the final version:
+
+```{r}
+enet_feat %>% nrow()
+```
+
+PSO-SVM model & features:
+
+```{r}
+pso_output <- readRDS(here("Rds/02_thromboPSO.Rds"))
+
+best.selection.pso <- paste(pso_output$lib.size,
+                            pso_output$fdr,
+                            pso_output$correlatedTranscripts,
+                            pso_output$rankedTranscripts, sep="-")
+
+particle_path <- file.path(here("pso-enhanced-thromboSeq1/outputPSO", 
+                           paste0(best.selection.pso,".RData")))
+
+load(particle_path) #Becomes dgeTraining
+dgeParticle <- dgeTraining #Rename to avoid namespace confusion
+rm(dgeTraining)
+
+
+#Features from PSO-SVM do not have coefficients, 
+#but they should come out of Thromboseq in a ranked order.
+
+psosvm.feat <- enframe(dgeParticle$biomarker.transcripts, "rank", "ensembl_gene_id") %>%
+  left_join(dgeParticle$genes, by = "ensembl_gene_id")
+
+head(psosvm.feat)
+```
+
+Number of PSO-SVM features:
+
+```{r}
+psosvm.feat %>% nrow()
+```
+
+## Overview
+
+```{r}
+enet_feat %>% head(30)
+```
+
+```{r}
+psosvm.feat %>% head(30)
+```
+
+## Boxplots
+
+### Elastic net features
+
+```{r}
+ggfeaturePlot <- function(dge, ens, df){
+  
+  stopifnot(length(ens) == 1)
+  dge$samples$sample <- colnames(dge)
+  
+  #Normalize
+  counts <- cpm(calcNormFactors(dge), log = T, normalized.lib.sizes = T)
+  
+  #Select relevant gene, convert to tidy format
+  counts <- as.data.frame(counts) %>%
+    rownames_to_column("ensembl_gene_id") %>%
+    filter(ensembl_gene_id == ens) %>%
+    select(-ensembl_gene_id) %>%
+    gather(key = "sample", value = "exp")
+  
+  #Add metadata
+  counts <- left_join(counts, dge$samples, by = "sample")
+  
+  gndf <- df %>% filter(ensembl_gene_id == ens)
+  
+  gn <- ifelse(gndf$hgnc_symbol == "", ensembl_gene_id,
+               paste(gndf$hgnc_symbol, gndf$ensembl_gene_id, sep=":"))
+  
+  title <- paste0(gn, ", Rank: ", gndf$rank)
+  
+  #Add coef if plotting enet
+  if("coef" %in% colnames(gndf)){
+    title <- paste0(title, ", Coef: ", signif(gndf$coef, 3))
+  }
+  
+  counts %>%
+    ggplot(aes(x = group, y = exp)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(color = hosp), alpha = 0.7, height = 0, width = 0.25) +
+    ggsci::scale_color_igv() +
+    ggtitle(title) +
+    facet_wrap(~Dataset)
+  
+}
+
+#ggfeaturePlot(dgeAll, ens = "ENSG00000113269", enet_feat)
+
+lapply(enet_feat$ensembl_gene_id[1:10],
+       function(x) ggfeaturePlot(dgeAll, ens = x, enet_feat))
+
+```
+
+### PSO-SVM features
+
+```{r}
+lapply(psosvm.feat$ensembl_gene_id[1:10],
+       function(x) ggfeaturePlot(dgeAll, ens = x, psosvm.feat))
+
+```
+
+## Heatmaps
+
+Plot elastic net features as a heatmap.
+
+### EN features in original data
+
+```{r}
+#Heatmap plotting
+feature_heatmap = function(dge,
+                           title="Heatmap", debug = F,
+                           top_vars = c("group","hosp"),
+                           features,
+                           legend_title = NULL,
+                           row_scale = F,
+                           row_size = 8, col_size = 8,
+                           show_col_names = F, show_row_names = T, ...){
+  
+  #Define colors
+  hmap_colors = list(
+    group = c(healthyControl="lightgray", breastCancer="black"),
+    hosp = ggsci::pal_lancet()(length(unique(dge$samples$hosp))),
+    Dataset = ggsci::pal_jco()(length(unique(dge$samples$Dataset)))
+  )
+  names(hmap_colors$hosp) = unique(dge$samples$hosp)
+  names(hmap_colors$Dataset) = unique(dge$samples$Dataset)
+  
+  top_colors = list(
+    #Dataset = hmap_colors$Dataset,
+    group = hmap_colors$group,
+    hosp = hmap_colors$hosp
+    )
+  #bottom_colors = list(group = hmap_colors$group)
+  
+  #Subset to only those genes used as features
+  dge <- dge[rownames(dge) %in% features, ]
+  
+  #Normalized count matrix
+  mat = edgeR::cpm(edgeR::calcNormFactors(dge),
+                   log = T, normalized.lib.sizes = T)
+  
+  #Row scale settings
+  if (row_scale==T){
+    mat = t(scale(t(mat)))
+  }
+  #Change legend according to whether input is scaled
+  if (row_scale==T){
+    hlp = list(title="rowscaled logcpm")
+  } else {
+    hlp = list(title="logcpm counts")
+  }
+  
+  #Replace ensembl IDs with gene names, or keep ensembl ID if gene names are absent
+  genes <- dge$genes
+  genes <- genes %>%
+    dplyr::mutate(gene_name = as.character(hgnc_symbol)) %>%
+    dplyr::mutate(
+      label = ifelse(gene_name == "" | is.na(gene_name),
+                    ensembl_gene_id, gene_name)
+      )
+  
+  #return(genes)
+  rownames(mat) <- genes$label
+  
+  sampledata <- as.data.frame(dge$samples)
+  
+  #Heatmap annotation
+  ann_top = sampledata[,top_vars, drop=F]
+  
+  #Top column annotation
+  colTop <- ComplexHeatmap::HeatmapAnnotation(
+    df=ann_top, which="col",
+    col = top_colors
+    #annotation_legend_param = list(list(title = legend_title))
+  )
+  #return(colTop)
+  
+  #Bottom column annotation
+  # ann_bottom = sampledata[,bottom_vars, drop=F]
+  # colBottom <- ComplexHeatmap::HeatmapAnnotation(
+  #   df=ann_bottom, which="col", col = bottom_colors
+  #   )
+  
+  if(debug){print(dim(mat))}
+  stopifnot(nrow(mat) == nrow(features))
+  
+  #Draw the heatmap
+  ComplexHeatmap::Heatmap(mat,
+          top_annotation = colTop,
+          #bottom_annotation = colBottom,
+          #left_annotation = rowAnno,
+          heatmap_legend_param = hlp,
+          show_row_names = show_row_names,
+          show_column_names = show_col_names,
+          cluster_rows = T,
+          row_names_gp = gpar(fontsize = row_size),
+          column_names_gp = gpar(fontsize = col_size),
+          column_title = title,
+          ...)
+}
+
+
+suppressMessages(
+  feature_heatmap(dgeOriginal,
+                   features = enet_feat$ensembl_gene_id,
+                  show_row_names = F,
+                  title = paste0("Elastic net features (", nrow(enet_feat), ") in original data"),
+                  row_scale = T)
+)
+
+```
+
+### EN features in blind validation data
+
+```{r}
+suppressMessages(
+  feature_heatmap(dgeBlindVal,
+                  features = enet_feat$ensembl_gene_id,
+                  show_row_names = F,
+                  title = paste0("Elastic net features (", nrow(enet_feat), ") in blind validation data"),
+                  row_scale = T)
+)
+```
+
+### Enet features in all data
+
+```{r}
+suppressMessages(
+  feature_heatmap(dgeAll,
+                  features = enet_feat$ensembl_gene_id,
+                  show_row_names = F,
+                  title = paste0("Elastic net features (", nrow(enet_feat), ") in all data"),
+                  row_scale = T)
+)
+```
+
+### PSO-SVM features in original data
+
+```{r}
+suppressMessages(
+  feature_heatmap(dgeOriginal,
+                  features = psosvm.feat$ensembl_gene_id,
+                  show_row_names = F,
+                  title = paste0("PSO-SVM features (", nrow(psosvm.feat), ") in original data"),
+                  row_scale = T)
+)
+```
+
+### PSO-SVM features in blind data
+
+```{r}
+suppressMessages(
+  feature_heatmap(dgeBlindVal,
+                  features = psosvm.feat$ensembl_gene_id,
+                  show_row_names = F,
+                  title = paste0("PSO-SVM features (", nrow(psosvm.feat), ") in blind data"),
+                  row_scale = T)
+)
+```
+
+### PSO-SVM features in all data
+
+```{r}
+suppressMessages(
+  feature_heatmap(dgeAll,
+                  features = psosvm.feat$ensembl_gene_id,
+                  show_row_names = F,
+                  title = paste0("PSO-SVM features (", nrow(psosvm.feat), ") in original data"),
+                  row_scale = T)
+)
+```
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,264 @@
+---
+title: "Exploration new metadata"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 4
+    highlight: kate
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(edgeR)
+library(tidyverse)
+```
+
+## Introduction
+
+We received an update from the VUMC team regarding the TEP metadata. Several controls originating from the VUMC were previously erroneously recorded as MGH controls, and several duplicates were removed. Here we validate and explore those changes. 
+
+## Load data
+
+Updated data:
+
+```{r}
+load(here("dataset/BrCa-dataset-201218_updatedClinicalInfo080821.RData"))
+```
+
+Rename to avoid namespace confusion:
+
+```{r}
+dgeUpdated <- dgeIncludedSamples
+rm(dgeIncludedSamples)
+```
+
+The MGH controls are all recoded as VUMC. Looks like there are no more Utrecht samples, they are now called UMCU.
+
+```{r}
+table(dgeUpdated$samples$patientgroup,dgeUpdated$samples$group)
+table(dgeUpdated$samples$isolationlocation,dgeUpdated$samples$group)
+```
+
+Previous data:
+
+```{r}
+load(here("dataset/BrCa-dataset-201218.RData"))
+```
+
+Rename again for clarity
+
+```{r}
+dgePrevious <- dgeIncludedSamples
+rm(dgeIncludedSamples)
+```
+
+Subset to only brca/hc for comparison.
+
+```{r}
+dgePrev <- dgePrevious[,dgePrevious$samples$group %in% c("breastCancer", "nonCancer")]
+dgePrev <- dgePrev[,dgePrev$samples$patientgroup %in% c("BRMETA", "breastCancer", "HC")]
+dgePrev$samples <- droplevels(dgePrev$samples)
+table(dgePrev$samples$patientgroup,dgePrev$samples$group)
+table(dgePrev$samples$isolationlocation,dgePrev$samples$group)
+```
+
+## Explore new data
+
+Same dimensions as expected.
+
+```{r}
+dim(dgeUpdated$samples)
+dim(dgePrev$samples)
+```
+
+Are the count matrices still the same?
+
+```{r}
+identical(dgeUpdated$counts, dgePrev$counts)
+```
+
+Sample names still the same?
+
+```{r}
+all(colnames(dgeUpdated) == colnames(dgePrev))
+```
+
+Case control status?
+
+```{r}
+all(dgeUpdated$samples$group == dgePrev$samples$group)
+all(dgeUpdated$samples$patientgroup == dgePrev$samples$patientgroup)
+```
+
+Lib size?
+
+```{r}
+all(dgeUpdated$samples$lib.size == dgePrev$samples$lib.size)
+```
+
+## Age
+
+Which samples have had their ages updated?
+
+```{r}
+dgeUpdated$samples %>%
+  rownames_to_column("sample_name") %>%
+  select(sample_name, group,name, hosp.new = isolationlocation, age.new = ageatbiopsy) %>%
+  full_join(., 
+            dgePrev$samples %>%
+              rownames_to_column("sample_name") %>%
+              select(sample_name, hosp.old = isolationlocation, age.old = ageatbiopsy),
+            by = "sample_name") %>%
+  filter(age.new != age.old)
+```
+
+## Gender
+
+The only difference here is whether M and NA are included as levels in the factor.
+
+```{r}
+dgeUpdated$samples %>%
+  rownames_to_column("sample_name") %>%
+  select(sample_name, group, hosp.new = isolationlocation, gender.new = gender) %>%
+  full_join(., 
+            dgePrev$samples %>%
+              rownames_to_column("sample_name") %>%
+              select(sample_name, hosp.old = isolationlocation, gender.old = gender),
+            by = "sample_name") %>%
+  filter(as.character(gender.new) != as.character(gender.old)) %>%
+  nrow()
+
+dgeUpdated$samples$gender %>% table()
+dgePrev$samples$gender %>% table()
+```
+
+## Isolationlocation
+
+Four Utrecht samples have been recoded as UMCU (UMC Utrecht) and 21 MGH samples have been relabelled as VUMC.
+
+```{r}
+dgeUpdated$samples %>%
+  rownames_to_column("sample_name") %>%
+  select(sample_name, group, patientgroup, hosp.new = isolationlocation) %>%
+  full_join(., 
+            dgePrev$samples %>%
+              rownames_to_column("sample_name") %>%
+              select(sample_name, hosp.old = isolationlocation),
+            by = "sample_name") %>%
+  filter(as.character(hosp.new) != as.character(hosp.old)) %>%
+  group_by(group, hosp.new, hosp.old) %>%
+  count()
+```
+
+## Stage
+
+One sample has gone from stage II to stage III. The rest are just recodings of empty space `""` to `n.a.`.
+
+```{r}
+dgeUpdated$samples %>%
+  rownames_to_column("sample_name") %>%
+  select(sample_name, group, hosp.new = isolationlocation, stage.new = stage) %>%
+  full_join(., 
+            dgePrev$samples %>%
+              rownames_to_column("sample_name") %>%
+              select(sample_name, hosp.old = isolationlocation, stage.old = stage),
+            by = "sample_name") %>%
+  filter(as.character(stage.new) != as.character(stage.old)) %>% 
+  group_by(group, stage.new, stage.old) %>%
+  count()
+```
+
+```{r}
+dgeUpdated$samples$stage %>%
+  table()
+
+dgePrev$samples$stage %>%
+  table()
+```
+
+## Duplicates
+
+>three of these samples as checked manually are now included twice, i.e. HC0053, HC0056 and HC0095, both the early and late processed samples from the sample individual and moment of blood drawal
+
+The age, stage and isolationlocation of these samples is unchanged. Blood related fields are absent. He must mean `isolatedin24h` vs `isolatedin48h`.
+
+```{r}
+dgeUpdated$samples %>%
+  rownames_to_column("sample_name") %>%
+  filter(name %in% c("HC0053", "HC0056", "HC0095")) %>%
+  select(sample_name, name, isolationlocation, ageatbiopsy, stage,
+         contains("blood"), contains("isolated")) %>%
+  arrange(name) %>%
+  left_join(., dgeUpdated$samples %>%
+              rownames_to_column("sample_name") %>%
+              filter(name %in% c("HC0053", "HC0056", "HC0095")) %>%
+              select(sample_name, isolationlocation.old = isolationlocation,
+                     age.old=ageatbiopsy, stage.old = stage),
+            by = "sample_name"
+  ) %>%
+  relocate(contains("old"), .after = stage)
+```
+
+How well are these samples from the same patient correlated?
+
+```{r}
+lapply(c("HC0053", "HC0056", "HC0095"),
+       function(x){
+         cor(dgeUpdated[,dgeUpdated$samples$name == x]$counts)
+       })
+
+```
+
+## Time on bench
+
+Have any more of the time on bench fields been filled in?
+
+```{r}
+#Combine 3 isolation time columns into a single column for the new data
+dgeUpdated$samples %>%
+  rownames_to_column("sample_name") %>%
+  select(sample_name, group, patientgroup, contains("isolat")) %>%
+  mutate(hosp = ifelse(isolationlocation %in% c("NKI", "MGH", "VUMC"),
+                       as.character(isolationlocation), "other")) %>%
+  rowwise() %>%
+  mutate(totals = sum(isolatedin1h,isolatedin24h, isolatedin48h)) %>%
+  mutate(iso_time_new = case_when(
+    is.na(isolatedin1h) & is.na(isolatedin24h) & is.na(isolatedin48h) ~ "missing",
+    totals != 1 ~ "error",
+    isolatedin1h == 1 ~ "1h",
+    isolatedin24h == 1 ~ "24h",
+    isolatedin48h == 1 ~ "48h",
+    TRUE ~ "missing"
+  )) %>% select(sample_name, hosp.new = isolationlocation, iso_time_new) %>%
+  full_join(.,
+            #Do the same for the old data and join to new data
+            dgePrev$samples %>%
+              rownames_to_column("sample_name") %>%
+              select(sample_name, group, patientgroup, contains("isolat")) %>%
+              mutate(hosp = ifelse(isolationlocation %in% c("NKI", "MGH", "VUMC"),
+                                   as.character(isolationlocation), "other")) %>%
+              rowwise() %>%
+              mutate(totals = sum(isolatedin1h,isolatedin24h, isolatedin48h)) %>%
+              mutate(iso_time_old = case_when(
+                is.na(isolatedin1h) & is.na(isolatedin24h) & is.na(isolatedin48h) ~ "missing",
+                totals != 1 ~ "error",
+                isolatedin1h == 1 ~ "1h",
+                isolatedin24h == 1 ~ "24h",
+                isolatedin48h == 1 ~ "48h",
+                TRUE ~ "missing"
+              )) %>% select(sample_name, iso_time_old),
+            by = "sample_name") %>%
+  #Show those with different times
+  filter(iso_time_new != iso_time_old)
+```
+
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,702 @@
+---
+title: "Predictions on the blind validation samples"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 4
+    highlight: kate
+    df_print: paged
+---
+
+In this notebook, we collect the blind validation sample set from the NKI and provide elastic net classifiers to predict cancer status.
+This can be compared with predictions made by the PSO-SVM.
+
+This validation series is done blind, so AUC performance estimates will be made by a third party.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(edgeR)
+library(RUVSeq)
+library(RColorBrewer)
+library(glmnet)
+library(doMC)
+library(here)
+library(caret)
+library(ROCR)
+library(pROC)
+library(tictoc)
+library(ggsci)
+library(ggthemes)
+library(openxlsx)
+library(tidyverse)
+library(e1071)
+
+theme_set(theme_bw())
+```
+
+## Load models
+
+Elastic net:
+
+```{r}
+model_altlambda <- readRDS(here("Rds/04_model_altlambda.Rds"))
+```
+
+PSO-SVM:
+
+```{r}
+pso_output <- readRDS(here("Rds/02_thromboPSO.Rds"))
+
+best.selection.pso <- paste(pso_output$lib.size,
+                            pso_output$fdr,
+                            pso_output$correlatedTranscripts,
+                            pso_output$rankedTranscripts, sep="-")
+
+particle_path <- file.path("pso-enhanced-thromboSeq1/outputPSO", #Originally without 1
+                           paste0(best.selection.pso,".RData"))
+
+load(particle_path) #Becomes dgeTraining
+dgeParticle <- dgeTraining #Rename to avoid namespace confusion
+rm(dgeTraining)
+```
+
+## Collect validation dataset
+
+We can use the existing function from ThromboSeq.
+
+```{r}
+#collect.read.counts is based off code from this file
+#source('bin/thromboSeqTools_PreProcessing_2.R') 
+
+#Altered to allow for Rds instead of RData
+collect.read.counts <- function(inputDir, 
+                                verbose = TRUE,
+                                Rds_path = here("dataset/blindVal.Rds")){
+  # Recognizes and loads all HTSeq files in the input directory and merges the individual 
+  # HTSeq files into one read count table
+  #
+  # Args:
+  #   inputDir: Directory in which the FASTQ-files have been mapped and output has been stored.
+  #             Does search recursively.
+  #   verbose:  Whether or not to show function output.
+  #
+  # Returns:
+  #   Count table with merged HTSeq files.
+  
+  if (!file.exists(inputDir)){
+    stop("Input directory does not exist. Provide valid input directory")
+  }
+  
+  # list all HTSeq files recursively in the input directory
+  hts <- list.files(path = inputDir, 
+                    pattern = "\\.htseq.ssv$", 
+                    full.names = TRUE, 
+                    recursive = TRUE
+  )
+  
+  if (verbose == TRUE){
+    print(paste("Number of HTSeq files detected: ", length(hts), sep = ""))  
+  }
+  
+  # read individual HTSeq files
+  # merge into a single count matrix
+  counts <- list()
+  for(sample in hts){
+    counts[[sample]] <- read.table(
+      file = sample, 
+      header = FALSE,
+      sep = "\t",
+      row.names = 1
+    )
+    # set sample name
+    name <- basename(sample)
+    name <- gsub(name, pattern = "\\.htseq.ssv", replacement = "")
+    colnames(counts[[sample]]) <- name
+  }
+  # merge read files into single count matrix
+  counts <- do.call("cbind", counts)
+  # remove QC output from HTSeq in the final rows of the count table
+  counts <- counts[grep("^__", rownames(counts), invert = T), ]
+  
+  # save counts into a Rds file
+  saveRDS(counts, file = Rds_path)
+  
+  # return the count matrix
+  return(counts)
+}
+
+valNKI <- collect.read.counts(inputDir = here("dataset/NKI-htseq"))
+
+```
+
+```{r}
+head(valNKI)
+
+valNKI <- as.matrix(valNKI)
+```
+
+Create DGElist for downstream use.
+
+```{r}
+#Omit group and sample info since this is blind
+dgeNKI <- edgeR::DGEList(counts = valNKI)
+
+dgeNKI$samples %>% head()
+stopifnot(all(duplicated(rownames(dgeNKI$samples))==F))
+```
+
+### Low count filter
+
+During training, gene counts were filtered for a minimum of 30 in at least 90% of samples.
+
+Both models underwent this filtering step.
+
+Enet transcripts:
+
+```{r}
+enet_transcripts <-as.data.frame(
+  as.matrix(
+    coef(model_altlambda$fit$finalModel,
+         model_altlambda$fit$bestTune$lambda)
+    )
+  ) %>%
+  dplyr::slice(-1) %>% #Remove intercept from coef list
+  rownames()
+```
+
+PSO transcripts:
+
+```{r}
+pso_transcripts <- rownames(dgeParticle$counts)
+```
+
+Sanity check
+
+```{r}
+#Both models had the same transcripts as input
+stopifnot(all(sort(enet_transcripts)==sort(pso_transcripts)))
+```
+
+We will need the NKI validation dataset to contain the same transcripts that pass this threshold.
+
+```{r}
+dgeNKIfilt <- dgeNKI[rownames(dgeNKI) %in% enet_transcripts,]
+print(paste("Transcripts in validation dataset at start:", nrow(valNKI)))
+print(paste("Transcripts in validation dataset after low count filter:", nrow(dgeNKIfilt)))
+
+#Sanity check
+stopifnot(all(rownames(dgeNKIfilt) == pso_transcripts))
+stopifnot(all(rownames(dgeNKIfilt) == enet_transcripts))
+```
+
+### Quality control
+
+ThromboSeqQC performs two steps:
+
+ 1) exclusion of samples with too little RNAs detected
+ 2) leave-one-sample-out cross-correlation, i.e. excluding samples with low correlation to each other
+ 
+Prior to LOOCV, RUVg normalization is performed, followed by TMM normalization and log transformation.
+However, the RUVg normalized matrix is not used further downstream.
+
+Since we ony have access to library size in this blind setting, lib size is the only confounder that can be used with ThromboSeqQC.
+Unfortunately, the function crashes when provided with less than two confounders.
+
+We therefore extract the relevant code to filter out samples below the minimum library threshold and perform LOOCV.
+
+Because we want to gain predictions for all samples, we will not actually exclude any based on LOOCV.
+
+```{r}
+print(paste("Number of validation samples prior to LOOCV:", ncol(dgeNKIfilt)))
+```
+
+```{r detection loop}
+
+min.count.filter <- function(dge, number.cores = 8, verbose =T,
+                             min.number.reads.per.RNAs.detected = 0, #Default value 
+                             min.number.total.RNAs.detected = 750){ #Default value 
+ 
+  doMC::registerDoMC(cores = number.cores)
+  detection.loop <- foreach(i = 1 : ncol(dge$counts)) %dopar% {
+    # calculate number of genes with more than zero raw read counts
+    # in case all genes are detected, summary would have only two output
+    # options and is.na would result in FALSE, hence the if-statement
+    sample.raw.counts <- dge$counts[, colnames(dge$counts)[i]]
+    if (as.character(is.na(summary(as.numeric(sample.raw.counts) > 0)[3]))){
+      sample.RNAs.detected <- as.numeric(summary(as.numeric(sample.raw.counts) > 
+                                                   min.number.reads.per.RNAs.detected)[2])  
+    } else {
+      sample.RNAs.detected <- as.numeric(summary(as.numeric(sample.raw.counts) > 
+                                                   min.number.reads.per.RNAs.detected)[3])  
+    }
+    
+    # store data in container
+    cont <- list()
+    cont[["sample"]] <- colnames(dge$counts)[i] # collect sample ID
+    cont[["sample.libsize"]] <- dge$samples[colnames(dge$counts)[i], "lib.size"] # collect lib.size
+    cont[["sample.RNAs.detected"]] <- sample.RNAs.detected
+    cont
+  }
+  
+  #detection.loop
+  # summarize data from loop into a data.frame
+  detection.data.frame <- data.frame(
+    sample = unlist(lapply(detection.loop, function(x){x[["sample"]]})),
+    lib.size = unlist(lapply(detection.loop, function(x){x[["sample.libsize"]]})),
+    RNAs.detected = unlist(lapply(detection.loop, function(x){x[["sample.RNAs.detected"]]}))
+  )
+  
+  if (verbose == TRUE){
+    print(paste("Median number of transcripts detected in dataset:", 
+                round(median(detection.data.frame$RNAs.detected), digits = 0)))
+  }
+  
+  #detection.data.frame
+  
+  # select samples that have to be excluded because of too little RNAs detected
+  samples.excluded.RNAs.detected <- detection.data.frame[detection.data.frame$RNAs.detected < 
+                                                           min.number.total.RNAs.detected, ]
+  
+  # update DGEList, and remove excluded samples
+  dgeIncludedSamples <- dge[, !colnames(dge) %in% samples.excluded.RNAs.detected$sample]
+  dgeIncludedSamples$samples <- droplevels(dgeIncludedSamples$samples)
+  
+  dgeIncludedSamples
+}
+
+dgeVal <- min.count.filter(dgeNKIfilt)
+```
+
+All samples pass this minimum threshold:
+
+```{r}
+print(paste("Number of samples after min lib size filter:", ncol(dgeVal)))
+```
+
+```{r}
+saveRDS(dgeVal, here("Rds/06_dgeVal.Rds"))
+```
+
+## Normalization
+
+Prior to making predictions, the validation dataset must be validated.
+
+For elastic net, the relevant normalization is edgeR's TMM followed by log2.
+For PSO-SVM, RUVg normalization is performed using parameters derived from the particle swarm.
+
+### Enet: TMM based on training samples
+
+The first approach requires a DGEList that contains both the samples used to train the model and the new samples.
+We will then calculate TMM using only the training samples as reference.
+This requires altering the base edgeR code, which we've done in `tmm_training_norm.R`.
+
+```{r}
+#All the modified edgeR code
+source(here("bin/tmm_training_norm.R")) 
+
+#The original DGEList used to train the model
+dgeFiltered <- readRDS(here("Rds/01_dgeFiltered.Rds")) 
+```
+
+Reminder: PSO-SVM iterates back and forth between "training" and "evaluation" samples to train the model, then tests performance on the "validation" set.
+For elastic net, training and evaluation samples were combined to train the model, with performance testing on the validation set.
+
+In this sense, in spite of the labels, both "training" and "evaluation" samples are really training samples.
+
+```{r}
+table(dgeFiltered$sample$Label)
+```
+
+Create a new DGEList that contains both the samples used to train the model ("training" + "evaluation") and the new validation dataset.
+
+```{r}
+#Ensure we're getting the right samples
+dgeTrainVal <- dgeFiltered$counts[,dgeFiltered$Label %in% c("Training", "Evaluation")]
+stopifnot(all(
+  colnames(dgeTrainVal) == rownames(dgeFiltered$samples)[dgeFiltered$samples$Label %in% c("Training", "Evaluation")]
+))
+
+#Create the DGEList with a sample info dataframe
+dgeTrainVal <- edgeR::DGEList(
+  counts = cbind(
+    dgeFiltered$counts[,dgeFiltered$samples$Label %in% c("Training", "Evaluation")], #Samples used to train the model
+    dgeVal$counts #New samples
+    ),
+  samples = data.frame(
+    Label = c(
+      rep("Training", sum(dgeFiltered$samples$Label %in% c("Training", "Evaluation"))),
+      rep("Validation", ncol(dgeVal$counts))
+    )
+  )
+)
+
+table(dgeTrainVal$samples$Label)
+```
+
+Retrieve the TMM sample reference:
+
+```{r}
+stopifnot(all(rownames(dgeTrainVal$samples) == colnames(dgeTrainVal)))
+#Store the rownames as a column
+dgeTrainVal$samples$sample <- rownames(dgeTrainVal$samples)
+
+dgeTrainVal$TMMref <- getTMMref(dgeTrainVal,
+                                samples.for.training = colnames(dgeTrainVal)[dgeTrainVal$samples$Label == "Training"])
+
+bind_cols(dgeTrainVal$TMMref,
+          dgeTrainVal$samples[rownames(dgeTrainVal$samples) == dgeTrainVal$TMMref$ref.sample, c("group", "Label")])
+```
+
+The `normalize.val` function will normalize the counts using the training-only TMM discussed above, then perform a log transformation.
+
+```{r}
+normalize.val <- function(
+  dge,
+  training.samples = colnames(dge)[dge$samples$Label == "Training"],
+  validation.samples = colnames(dge)[dge$samples$Label == "Validation"],
+  refCol = dge$TMMref$col.index
+  ){
+  
+  #Should be no overlap
+  stopifnot(length(Reduce(intersect, list(training.samples,validation.samples)) > 0)==0) 
+  
+  #Performs training-only TMM normalization and a log tranformation with a pseudocount
+  #counts <- normalize.tmm(dge = dge,
+  #                        tmm.ref.from.training = T,
+  #                        training.samples = training.samples)
+  
+  dge <- calcNormFactorsTraining(object = dge,
+                                 normalize.on.training.series = T,
+                                 samples.for.training = training.samples,
+                                 refColumn=refCol)
+  
+  # calculate counts-per-million matrix, log-transformed and normalized via the TMM-normalization factor
+  # (cpm with normalized.lib.size=T after calculating norm factors yields a TMM-normalized matrix)
+  counts <- cpm(dge, log = T, normalized.lib.sizes = T) 
+  
+  #Subset counts
+  #train <- counts[, train_samples] #We only want the validation samples here
+  val <- counts[, validation.samples]
+  val 
+}
+
+enet_val <- normalize.val(dge = dgeTrainVal)
+enet_val[1:4,1:4]
+```
+
+### PSO: RUVg
+
+Because the RUVg parameters were derived from the particle swarm, this can only be input for the PSO-SVM classifier.
+
+```{r additional edgeR requirement for pso val, include=F}
+.calcFactorWeighted <- function(obs, ref, libsize.obs=NULL, libsize.ref=NULL,
+                                logratioTrim=.3, sumTrim=0.05, doWeighting=TRUE, Acutoff=-1e10)
+  #	TMM between two libraries
+{
+  obs <- as.numeric(obs)
+  ref <- as.numeric(ref)
+  
+  if( is.null(libsize.obs) ) nO <- sum(obs) else nO <- libsize.obs
+  if( is.null(libsize.ref) ) nR <- sum(ref) else nR <- libsize.ref
+  
+  logR <- log2((obs/nO)/(ref/nR))			# log ratio of expression, accounting for library size
+  absE <- (log2(obs/nO) + log2(ref/nR))/2	# absolute expression
+  v <- (nO-obs)/nO/obs + (nR-ref)/nR/ref	 # estimated asymptotic variance
+  
+  #	remove infinite values, cutoff based on A
+  fin <- is.finite(logR) & is.finite(absE) & (absE > Acutoff)
+  
+  logR <- logR[fin]
+  absE <- absE[fin]
+  v <- v[fin]
+  
+  if(max(abs(logR)) < 1e-6) return(1)
+  
+  #	taken from the original mean() function
+  n <- length(logR)
+  loL <- floor(n * logratioTrim) + 1
+  hiL <- n + 1 - loL
+  loS <- floor(n * sumTrim) + 1
+  hiS <- n + 1 - loS
+  
+  #	keep <- (rank(logR) %in% loL:hiL) & (rank(absE) %in% loS:hiS)
+  #	a fix from leonardo ivan almonacid cardenas, since rank() can return
+  #	non-integer values when there are a lot of ties
+  keep <- (rank(logR)>=loL & rank(logR)<=hiL) & (rank(absE)>=loS & rank(absE)<=hiS)
+  
+  if(doWeighting)
+    f <- sum(logR[keep]/v[keep], na.rm=TRUE) / sum(1/v[keep], na.rm=TRUE)
+  else
+    f <- mean(logR[keep], na.rm=TRUE)
+  
+  #	Results will be missing if the two libraries share no features with positive counts
+  #	In this case, return unity
+  if(is.na(f)) f <- 0
+  2^f
+}
+```
+
+```{r}
+#source(here("bin/thromboSeqTools_PreProcessing_2.R"))
+#From the ThromboSeq package, shown here for transparency
+
+perform.RUVg.correction.validation <- function(dge = dge,
+                                               output.particle = dgeParticle){
+  # Performs the RUVSeq confounding variable correction specifically in a validation setting, i.e.
+  # with known stable transcripts, confounding axes, and correction factors.
+  #
+  # Args:
+  #   dge: DGEList with dataset count table, sample info and gene info tables.
+  #   output.particle: DGEList compiled during the PSO process with the setting specific
+  #                    stable transcripts, ruv-axes, and correction factors.
+  #
+  # Returns:
+  #   DGEList including the corrected raw read counts.
+  
+  # remove the factors that were identified as potential confounding variables from the dataset
+  # collect all output from the specific particle for correction of the counts of the to-be classified sample series
+  axis.group <- output.particle$axis.group
+  axis.na <- output.particle$axis.na
+  axis.confounding <- output.particle$axis.confounding
+  axis.all <- output.particle$axis.all
+  axis.drop <- 0
+  axis.removed <- FALSE
+  k.variables <- length(output.particle$axis.all)
+  # loop the included k.variables and correct if necessary
+  tmp.loop <- foreach(i = 1 : k.variables) %do% {
+    if (i == 1) {
+      if (i %in% axis.confounding) {
+        RUVg.post.correction <- RUVg(as.matrix(dge$counts), output.particle$stable.transcripts, k = axis.drop + 1, drop = 0)
+        axis.removed <- TRUE
+      } else {
+        axis.drop <- 1
+      }
+    } else {
+      if (i %in% axis.confounding) {
+        if(axis.removed == TRUE) {
+          RUVg.post.correction <- RUVg(as.matrix(RUVg.post.correction$normalizedCounts), output.particle$stable.transcripts, k = axis.drop + 1, drop = axis.drop)
+        } else {
+          RUVg.post.correction <- RUVg(as.matrix(dge$counts), output.particle$stable.transcripts, k = axis.drop + 1, drop = axis.drop)
+          axis.removed <- TRUE
+        }
+      } else {
+        axis.drop <- axis.drop + 1
+      }
+    }
+  }
+  
+  # prepare a new corrected countmatrix, update the total library size
+  dge$raw.counts <- dge$counts
+  if (length(axis.confounding) > 0){
+    # if RUVg correction has been performed, add the updated countmatrix to the dge-object
+    dge$ruv.counts <- as.data.frame(RUVg.post.correction$normalizedCounts)
+  }
+  dge$samples$ruv.lib.size <- colSums(dge$ruv.counts)
+  
+  # return corrected DGEList
+  return(dge)
+}
+
+dgeRUV <- perform.RUVg.correction.validation(dge=dgeTrainVal, output.particle = dgeParticle)
+#dgeRUV$raw.counts[1:4,1:4] #Slight difference
+#dgeRUV$ruv.counts[1:4,1:4]
+
+#Should all be 1
+stopifnot(all(dgeRUV$samples$norm.factors==1))
+
+#Replace the counts with ruv counts
+dgeRUV$counts <- dgeRUV$ruv.counts
+
+#Correct the lib size post RUV
+dgeRUV$samples$raw.lib.size <- dgeRUV$samples$lib.size
+dgeRUV$samples$lib.size <- dgeRUV$samples$ruv.lib.size
+
+#Ensure the training labels exist
+stopifnot(all(colnames(dgeTrainVal) == colnames(dgeRUV)))
+dgeRUV$samples$Label <- dgeTrainVal$samples$Label
+dgeRUV$samples <- droplevels(dgeRUV$samples)
+
+#Add the TMM ref from the particle
+dgeRUV$TMMref <- NULL #Remove the one we calculated for enet
+dgeRUV$refSample <- which(colnames(dgeRUV) == names(dgeParticle$refSample))
+names(dgeRUV$refSample) <- names(dgeParticle$refSample)
+
+# calculate newest total read counts (lib.size)
+pso.training.samples <- colnames(dgeParticle)[dgeParticle$samples$Label == "Training"]
+stopifnot(all(pso.training.samples %in% colnames(dgeRUV)))
+
+pso.training.samples <- pso.training.samples[order(match(pso.training.samples,colnames(dgeRUV)))]
+
+#Retrieve normalization factors
+dgeRUV <- suppressWarnings(calcNormFactorsTraining(object = dgeRUV,
+                                                 normalize.on.training.series = T,
+                                                 samples.for.training = pso.training.samples,
+                                                 refColumn=dgeRUV$refSample[[1]]))
+
+
+# calculate counts-per-million matrix, log-transformed and normalized via the TMM-normalization factor
+pso_val <- cpm(dgeRUV, log = T, normalized.lib.sizes = T) 
+pso_val <- pso_val[,colnames(pso_val) %in% colnames(dgeVal)]
+pso_val[1:4,1:4]
+```
+
+We will need the RUVg-corrected count matrix for investigating batch correction methods later on.
+
+```{r}
+saveRDS(dgeRUV, here("Rds/06_dgeRUV.Rds"))
+```
+
+### Correlation by normalization strategy
+
+How similar are these strategies?
+
+```{r corplot1}
+plot_norm_strats <- function(x, y){
+  
+  dfx <- as.data.frame(x) %>%
+    gather(key = "sample", "norm.count")
+  
+  xlab <- deparse(substitute(x))
+  
+  dfy <- as.data.frame(y) %>%
+    gather(key = "sample", "norm.count")
+  
+  ylab <- deparse(substitute(y))
+  
+  stopifnot(all(dfx$sample == dfy$sample))
+  
+  #df <- left_join(dfx, dfy, by = "sample")
+  df <- tibble(sample = dfx$sample,
+               norm.count.x = dfx$norm.count,
+               norm.count.y = dfy$norm.count
+               )
+  rcor <- round(cor(df$norm.count.x, df$norm.count.y),3)
+  
+  df %>%
+    ggplot(aes(x = norm.count.x, y = norm.count.y)) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    xlab(xlab) +
+    ylab(ylab) +
+    ggtitle(paste("Correlation", xlab, "and", ylab, ":", rcor))
+  
+  
+}
+
+plot_norm_strats(x = enet_val, y = pso_val)
+```
+
+## Elastic net predictions
+
+Predict sample class with probabilites for normalized matrices.
+
+```{r}
+enet_pred <- function(fit, val_data){
+  
+  class = cbind(
+    sample = colnames(val_data),
+    predicted.group = as.character(predict(fit, newdata = t(val_data), type="raw"))
+  )
+  
+  probs = predict(fit, newdata = t(val_data), type="prob")
+  colnames(probs) <- paste0("prob.",colnames(probs))
+  probs$model <- "elastic net"
+  
+  cbind(class, probs) %>%
+    select(sample:predicted.group, prob.breastCancer, everything())
+  
+}
+
+enet_predictions <- enet_pred(fit = model_altlambda$fit, val_data = enet_val)
+
+head(enet_predictions)
+```
+
+## PSO-SVM predictions
+
+Strategy: PSO-optimized RUVg followed by training-only TMM and cpm/log2
+
+```{r}
+pso_pred <- function(dge=dgeParticle, val_data){
+  
+  library(e1071) #Required for predict to work on svm
+  
+  predictions <- predict(
+    dge$tuned.svm.model,
+    newdata = t(val_data)[,dge$biomarker.transcripts], #Feature space must be identical 
+    probability = TRUE
+    )
+  
+  probs <- attributes(predictions)$probabilities %>%
+    as.data.frame() 
+  colnames(probs) <- paste0("prob.",colnames(probs))
+  
+  svm.summary <- data.frame(
+    sample = attributes(predictions)$names,
+    predicted.group = as.character((predictions)[1:length(predictions)])
+  )
+  
+  svm.summary <- cbind(svm.summary,probs)
+  svm.summary$model <- "pso-svm"
+  rownames(svm.summary) <- NULL
+  svm.summary
+
+}
+
+pso_predictions <- pso_pred(val_data = pso_val)
+
+head(pso_predictions)
+```
+
+## Enet vs PSO probabilities
+
+We don't have the class labels, but we can still check to see how far apart the two algorithms are.
+
+```{r}
+table(enet_predictions$predicted.group == pso_predictions$predicted.group)
+```
+
+Dot plot:
+
+```{r}
+plot(x = enet_predictions$prob.breastCancer,
+     y = pso_predictions$prob.breastCancer,
+     main = "Breast cancer probabilty by sample in enet vs pso-svm")
+```
+
+## Write predictions to Excel
+
+Save this for the third party:
+
+```{r}
+saveRDS(object = list(enet_predictions = enet_predictions,
+                      pso_predictions = pso_predictions),
+        file = here("Rds/06_predictions.Rds"))
+```
+
+For a reminder, this is the cross table for the final chosen strategies.
+
+```{r}
+tibble(enet = enet_predictions$predicted.group, 
+       pso = pso_predictions$predicted.group) %>%
+  table()
+```
+
+Excel output:
+
+```{r}
+#fp stands for "fixed partition", to distinguish this from predictions made with models trained on all samples
+
+openxlsx::write.xlsx(x = list(
+  enet_preds_fp = enet_predictions,
+  pso_preds_fp = pso_predictions
+),
+file = here("06_predictions.xlsx"))
+```
+
+```{r}
+sessionInfo()
+```

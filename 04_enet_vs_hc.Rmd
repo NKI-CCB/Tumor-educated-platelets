@@ -1,0 +1,983 @@
+---
+title: "Elastic net performance vs hc"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 4
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(foreach)
+library(edgeR)
+library(RUVSeq)
+library(RColorBrewer)
+library(glmnet)
+library(here)
+library(caret)
+library(ROCR)
+library(pROC)
+library(tictoc)
+library(ggsci)
+library(ggthemes)
+library(tidyverse)
+
+theme_set(theme_bw())
+```
+
+Previously, we assessed particle swarm optimized support vector machine performance on age and stage matched breast cancer vs control samples.
+In this notebook, we compare the PSO-SVM performance to an elastic net classifier on the same sample allocations.
+Both elastic net parameters (alpha and lambda) will be tuned.
+
+## Recap sample allocation
+
+Samples are subsetted down to breast cancer vs healthy controls, normalized, and matched between training, evaluation and validation sets for age and stage.
+
+See notebook one for details.
+
+HC vs BrCa table:
+
+```{r}
+dgeFiltered <- readRDS(here("Rds/01_dgeFiltered.Rds"))
+
+#dgeFiltered$samples %>% colnames() %>% tail()
+dgeFiltered$samples %>%
+  select(Label, group) %>%
+  table()
+```
+
+By stage:
+
+```{r}
+dgeFiltered$samples %>%
+  select(Label, stage) %>%
+  table()
+```
+
+
+```{r}
+dgeFiltered$samples %>%
+  ggplot(aes(x = Label,  fill = stage)) +
+  geom_bar() +
+  ggsci::scale_fill_nejm() +
+  ggtitle("Stage distribution across sample labels")
+
+```
+
+By age:
+
+```{r}
+dgeFiltered$samples %>%
+  ggplot(aes(x = Label, y = Age, fill = Label)) +
+  geom_boxplot() +
+  ggsci::scale_fill_nejm() +
+  ggtitle("Age distribution across sample labels")
+```
+
+By hospital:
+
+```{r}
+dgeFiltered$samples %>%
+  select(group, isolationlocation) %>%
+  table()
+```
+
+## Combining training and evaluation for enet
+
+PSO-SVM requires separate training and evaluation sets to train the algorithm, with an independent validation set for testing.
+
+For elastic net, the distinction between training and evaluation is unnecessary.
+
+Pool the training and evaluation samples from PPSO together and train an elastic net, then evaluate its performance on the PPSO validation set.
+
+```{r}
+train.samples <- colnames(dgeFiltered)[dgeFiltered$samples$Label %in% c("Training", "Evaluation")]
+
+val.samples <- colnames(dgeFiltered)[dgeFiltered$samples$Validation]
+earlyval.samples <- rownames(filter(dgeFiltered$samples, Validation == T & stage %in% c("I","II", "healthyControl")))
+lateval.samples <- rownames(filter(dgeFiltered$samples, Validation == T & stage %in% c("III","IV", "healthyControl")))
+
+#Should be no overlap
+stopifnot(length(Reduce(intersect, list(train.samples,val.samples)) > 0)==0) 
+stopifnot(length(Reduce(intersect, list(train.samples,earlyval.samples)) > 0)==0) 
+stopifnot(length(Reduce(intersect, list(train.samples,lateval.samples)) > 0)==0) 
+```
+
+## Normalization strategy
+
+PSO-SVM uses RUVg normalization.
+
+When thromboSeqQC calls `perform.RUVg.correction()`, it operates at the *sample level* and discards samples which correlate too well with potential confounding factors. It produces an RUV count matrix which is stored, but not immediately used.
+
+Main PSO function `thromboSeqPSO()` uses particle swarm optimization to optimize `thrombo.algo()`, which itself calls `perform.RUVg.correction` again and seeks to optimize the input panel from RUVg at the *gene level*.
+
+When `thrombo.algo()` calls `perform.RUVg.correction()`, it replaces the count matrix with RUV corrected counts prior to classification, using parameter `training.series.only = T`. It then calls `calcNormFactorsThromboseq()` to employ TMM normalization with normalize.on.training.series = TRUE. Afterwards, logspace cpm are calculating using the TMM normalization factors with `cpm(dgeTraining, log = T, normalized.lib.sizes = T)`. The same series of functions are called prior to `thromboSeqANOVA`, where `perform.RUVg.correction(training.series.only = T)` but `calcNormFactorsThromboseq(normalize.on.training.series= F)`.
+
+Ideally, we'd like to test the elastic net using the same kind of normalization as PSO-SVM, but there's a problem.
+
+The problem is that in a validation setting, `perform.RUVg.correction.validation()` is called instead of `perform.RUVg.correction()`. The difference is that when calculating performance, RUVSeq confounding variable correction is performed with known stable transcripts, confounding axes, and correction factors *that come from the PSO-SVM results*. In other words, the normalization parameters are *not independent* of the classifier performance.
+
+We can't use PSO-SVM output to train the elastic net, or else the elastic net feature selection will be biased by the PSO-SVM. Neither can we just call `perform.RUVg.correction()` when prepping for the elastic net. If we do so, we will end up with different input than we had with the particle swarm.
+
+We can see this right away if we look at feature selection post PSO-SVM...
+
+```{r}
+best_pso <- mutate(readRDS(here("Rds/02_thromboPSO.Rds")),
+       file=paste(lib.size, fdr, correlatedTranscripts, rankedTranscripts, sep="-"))$file
+load(file.path(here("pso-enhanced-thromboSeq1","outputPSO"), paste0(best_pso, ".RData")))
+print(paste("Number of stable transcripts selected for RUV-module correction by particle swarm:",
+            length(dgeTraining$stable.transcripts)))
+```
+
+...and compare it to what happens if we call perform.RUVg.correction directly.
+
+```{r}
+source(here("bin/thromboSeqTools_PSO.R"))
+source(here("bin/thromboSeqTools_PreProcessing_2.R"))
+source(here("bin/thromboSeqTools_ANOVA.R"))
+
+dgeRUV <- perform.RUVg.correction(dge = dgeFiltered, 
+                                  k.variables = 4, 
+                                  variable.to.assess = c("Age","lib.size", "isolationlocation"),
+                                  variable.threshold = c(0.2, 0.6, 0.2),
+                                  training.series.only = T,
+                                  training.series.only.samples = train.samples,
+                                  verbose = T)
+```
+
+```{r clean up environment, include=F}
+#We don't want all those thromboSeqTools functions in the env
+rm(list = ls())
+
+dgeFiltered <- readRDS(here("Rds/01_dgeFiltered.Rds"))
+train.samples <- colnames(dgeFiltered)[dgeFiltered$samples$Label %in% c("Training", "Evaluation")]
+
+val.samples <- colnames(dgeFiltered)[dgeFiltered$samples$Validation]
+earlyval.samples <- rownames(filter(dgeFiltered$samples, Validation == T & stage %in% c("I","II", "healthyControl")))
+lateval.samples <- rownames(filter(dgeFiltered$samples, Validation == T & stage %in% c("III","IV", "healthyControl")))
+
+#Should be no overlap
+stopifnot(length(Reduce(intersect, list(train.samples,val.samples)) > 0)==0) 
+stopifnot(length(Reduce(intersect, list(train.samples,earlyval.samples)) > 0)==0) 
+stopifnot(length(Reduce(intersect, list(train.samples,lateval.samples)) > 0)==0) 
+```
+
+Because of this issue, we will test the elastic net WITHOUT RUVg correction.
+
+We will, however, keep TMM normalization and log2 transformation, as well as the ability to ensure that the TMM reference sample comes from the training group.
+
+We isolated the relevant code in `bin/tmm_training_norm.R`. It is mostly based on the Thromboseq code, with some re-writes for readability.
+
+```{r retrieve ref sample}
+source(here("bin/tmm_training_norm.R"))
+```
+
+Get the reference sample for TMM:
+
+```{r}
+dgeFiltered$TMMref <- getTMMref(dgeFiltered, samples.for.training = train.samples)
+
+bind_cols(dgeFiltered$TMMref,
+          dgeFiltered$samples[rownames(dgeFiltered$samples) == dgeFiltered$TMMref$ref.sample, c("group", "Label")])
+
+```
+
+The label here is technically Evaluation rather than Training, which was inherited from the particle swarm.
+For the elastic net, the evaluation partition is not meaningful. 
+Training and evaluation partitions are combined to train the model.
+Important is that the sample does not come from the validation set.
+
+## Summary
+
+The input for normalization is `dgeFiltered`.
+dgeFiltered has been subject to the following processing steps in notebook 1 via `ThromboSeqQC()` and `filter.for.platelet.transcriptome()`:
+
+* Low count filtering (minimum.read.counts = 30, in at least 90% of the samples)
+* Exclusion of samples with too little RNAs detected (min.number.total.RNAs.detected = 750)
+* Leave-one-sample-out cross-correlation, i.e. excluding samples with low correlation to each other (threshold = 0.3)
+
+Although an RUVg corrected count matrix was produced during these pre-processing steps, it is *not used*.
+
+The steps performed by normalization prior to training the elastic net are:
+
+* TMM normalization via edgeR, using only training samples as the reference 
+* Log transformation with pseudocount and lib size normalization
+
+```{r}
+#Show contents of wrapper
+#See tmm_training_norm.R for contents of calcNormFactorsTraining (long)
+normalize.tmm
+```
+
+## Elastic net design
+
+### Tuning grid
+
+Set up a tuning grid for lambda and alpha.
+We'd like lambda to be generated the same way it usually is for glmnet.
+[Source](https://stackoverflow.com/questions/23686067/default-lambda-sequence-in-glmnet-for-cross-validation)
+
+```{r}
+#rm(lambda.grid)
+
+lambda.grid <- function(x, debug=F){
+  
+  y <- rnorm(x)
+  n <- nrow(x)
+  
+  ## Standardize variables: (need to use n instead of (n-1) as denominator)
+  mysd <- function(y) sqrt(sum((y-mean(y))^2)/length(y))
+  
+  sx <- scale(x, scale = apply(x, 2, mysd))
+  sx <- as.matrix(sx, ncol = 20, nrow = 100)
+  sy <- as.vector(scale(y, scale = mysd(y)))
+  
+  ## Calculate lambda path (first get lambda_max):
+  lambda_max <- max(abs(colSums(sx*sy)))/n
+  epsilon <- .0001
+  K <- 100
+  lambdapath <- round(exp(seq(log(lambda_max), log(lambda_max*epsilon), 
+                              length.out = K)), digits = 10)
+  
+  if(debug){
+    list(sx = sx, sy = sy, y = y)
+  } else {
+    lambdapath
+  }
+  
+}
+
+
+lambdas <- lambda.grid(t(dgeFiltered$counts))
+c(lambdas %>% head(), lambdas %>% tail())
+
+```
+
+We can compare this to an alternative lambda grid with higher spacing.
+
+```{r}
+lambda.alt <- 10^seq(-3, 3, length = 100)
+
+lambda.df <- tibble(lambda = c(lambdas, lambda.alt),
+       series = c(rep("glmnet lambda", length(lambdas)),
+                  rep("alt lambda", length(lambda.alt))
+                  )
+       )
+
+ggplot(lambda.df , aes(x = lambda, color = series, fill = series)) +
+  geom_density(alpha = 0.2) +
+  geom_rug(aes(x = lambda, y = 0)) +
+  scale_x_log10() +
+  ggtitle("Lambda grid comparisons")
+```
+
+Alpha will be 10 values from 0 (Ridge) to 1 (Lasso).
+
+```{r}
+alphas <- seq(0,1, by=0.1)
+```
+
+The grid will be set up thusly:
+
+```{r}
+glmnet_grid <- expand.grid(alpha = alphas, lambda = lambdas)
+
+alt_grid <- expand.grid(alpha = alphas, lambda = lambda.alt)
+
+head(glmnet_grid)
+```
+
+### Model training
+
+Design a function to train the elastic net.
+Processes a dgeList into separate (transposed) matrices for training and validation.
+Returns a list containing the trained model, a list containing the training matrix and the true class labels, and a list containing the validation matrix and the true class labels.
+The validation set will be used to assess model performance via a separate function later on.
+
+```{r}
+#Testing
+#dge <- dgeFiltered
+#train_samples <- train.samples
+#val_samples <- val.samples
+
+enet_train <- function(
+  dge = dgeFiltered,
+  train_samples, #A vector matching the column names of training samples
+  val_samples, #A vector matching the column names of training samples
+  grid, #An object created by expand.grid
+  verboseIter = F, #Whether to print progress by fold
+  refCol = dgeFiltered$TMMref$col.index, #The column index of the TMM reference sample
+  time_elapsed = T
+){
+  
+  if(sum(train_samples %in% val_samples > 0)){
+    stop("There should be no overlap between training and eval")
+  }
+  
+  start <- Sys.time()
+  
+  #Ensure that sample names don't get shuffled
+  dge$samples$sample_name <- colnames(dge)
+  
+  #Subset dge
+  relevant_samples <- colnames(dge)[colnames(dge) %in% c(train_samples, val_samples)]
+  dge <- dge[,relevant_samples]
+  dge$samples <- droplevels(dge$samples)
+  
+  stopifnot(all(dge$samples$sample_name == colnames(dge)))
+  
+  #Normalize  counts
+  counts <- normalize.tmm(dge = dge,
+                          tmm.ref.from.training = T,
+                          training.samples = train_samples,
+                          refCol=refCol)
+  #return(counts)
+  
+  #Subset counts
+  train <- counts[, train_samples]
+  val <- counts[, val_samples]
+  
+  #Retrieve true classes
+  #Fort training set
+  train_true <- dge$samples %>%
+    filter(sample_name %in% colnames(train)) %>%
+    select(sample_name, group)
+  
+  #For validation set
+  val_true <- dge$samples %>%
+    filter(sample_name %in% colnames(val)) %>%
+    select(sample_name, group)
+  
+  #Ensure that column/sample names don't get shuffled
+  train_true <- train_true[order(match(train_true$sample_name,colnames(train))),]
+  stopifnot(all(train_true$sample_name == colnames(train)))
+  
+  val_true <- val_true[order(match(val_true$sample_name, colnames(val))),]
+  stopifnot(all(val_true$sample_name == colnames(val)))
+  
+  model <- caret::train(
+    x = t(train),
+    y = train_true$group,
+    method = "glmnet",
+    metric = "ROC",
+    tuneGrid = grid,
+    #tuneLength = 10,
+    #trControl = trainControl("cv", number = 10),
+    trControl = trainControl(
+      method = "cv", number = 10,
+      verboseIter = verboseIter,
+      classProbs=TRUE,
+      summaryFunction = twoClassSummary
+    ),
+  )
+  
+  end <- Sys.time()
+  
+  if(time_elapsed){print(end-start)}
+  
+  list(fit = model,
+       train = list(data = t(train),
+                    labels = train_true),
+       test = list(data = t(val),
+                   labels = val_true)
+       )
+}  
+  
+
+```
+
+Train the models using both lambda series.
+
+```{r}
+set.seed(321)
+
+outFile <- here("Rds/04_model_glmlambda.Rds")
+overwrite <- T
+
+if(!file.exists(outFile) | overwrite == T){
+  model.glmlambda = enet_train(
+    dge = dgeFiltered,
+    train_samples = train.samples,
+    val_samples = val.samples,
+    grid = glmnet_grid,
+    refCol = dgeFiltered$TMMref$col.index,
+    verboseIter = F,
+    time_elapsed = T
+  )
+  
+  saveRDS(model.glmlambda, outFile)
+} else {
+  model.glmlambda <- readRDS(outFile)
+}
+
+```
+
+```{r}
+set.seed(321)
+
+outFile <- here("Rds/04_model_altlambda.Rds")
+overwrite <- T
+
+if(!file.exists(outFile) | overwrite == T){
+  model.altlambda = enet_train(
+    dge = dgeFiltered,
+    train_samples = train.samples,
+    val_samples = val.samples,
+    grid = alt_grid,
+    refCol = dgeFiltered$TMMref$col.index,
+    verboseIter = F,
+    time_elapsed = T
+  )
+  
+  saveRDS(model.altlambda, outFile)
+} else {
+  model.altlambda <- readRDS(outFile)
+}
+
+```
+
+Hyperparameters for both models:
+
+```{r}
+rbind(model.glmlambda$fit$bestTune,
+      model.altlambda$fit$bestTune) %>%
+  mutate(lambda.series = c("glmnet", "alt"))
+```
+
+
+```{r}
+#which(lambdas==model.glmlambda$bestTune$lambda)
+#which(lambda.alt==model.altlambda$bestTune$lambda)
+
+tibble(lambda = lambdas, series = "glmnet",
+       best_lambda = (lambda == model.glmlambda$fit$bestTune$lambda)) %>%
+  bind_rows(.,
+            tibble(lambda = lambda.alt, series = "alt lambda",
+                   best_lambda = (lambda == model.altlambda$fit$bestTune$lambda))) %>%
+  ggplot(., aes(y = lambda, x = series, color = best_lambda)) +
+  geom_jitter(width = 0.2, height = 0, alpha = 0.7) +
+  scale_y_log10() +
+  ggthemes::scale_color_colorblind() +
+  ggtitle("Lambda tuning by series")
+
+```
+
+## Feature selection
+
+Retrieve the features from both models:
+
+```{r}
+feature_extraction <- function(fit, dict = dgeFiltered$genes){
+   coef(fit$finalModel, fit$bestTune$lambda) %>%
+    as.matrix() %>% as.data.frame() %>%
+    slice(-1) %>% #Remove intercept
+    rownames_to_column("feature") %>%
+    rename(coef = "1") %>%
+    filter(coef !=0) %>%
+    left_join(., dict, by = c("feature" = "ensembl_gene_id")) %>%
+    rename("ensembl_gene_id"=feature)
+}
+
+features.glmlambda <- feature_extraction(model.glmlambda$fit)
+features.altlambda <- feature_extraction(model.altlambda$fit)
+```
+
+Compared to PSO-SVM, the elastic net consistently selects fewer transcripts, regardless of which lambda series is used.
+
+```{r}
+best_pso <- mutate(readRDS(here("Rds/02_thromboPSO.Rds")),
+       file=paste(lib.size, fdr, correlatedTranscripts, rankedTranscripts, sep="-"))$file
+load(file.path(here("pso-enhanced-thromboSeq1","outputPSO"), paste0(best_pso, ".RData")))
+
+tibble(
+  model = c("Enet with glmnet lambda", "Enet with extended lambda", "PSO-SVM"),
+  nBiomarkers = c(nrow(features.glmlambda),
+                  nrow(features.altlambda),
+                  length(dgeTraining$biomarker.transcripts)),
+)
+```
+
+The elastic net models return the same transcripts, with a bit more in the glmnet lambda series
+
+```{r}
+print(paste("Genes in common between the elastic net models:",
+            length(intersect(features.glmlambda$ensembl_gene_id, features.altlambda$ensembl_gene_id))))
+```
+
+Most but not all of these are also selected as biomarker by the particle swarm:
+
+```{r}
+length(Reduce(intersect, list(features.glmlambda$ensembl_gene_id,
+                              features.altlambda$ensembl_gene_id,
+                              dgeTraining$biomarker.transcripts)))
+```
+
+## Elastic net performance
+
+This function takes the various list elements from an object produced by `enet_train`.
+`Fit` will be an object of class `train` produced by caret.
+`test_data` is a samples x feature matrix that has already been normalized.
+`true_labels` is a vector of true class labels that matches the rows of `test_data`.
+
+```{r}
+enet_auc <- function(fit, test_data, true_labels, doublecheck = F){
+  
+  #Make the predictions for probability
+  predictions <- predict(fit, newdata = test_data, type="prob")
+  
+  
+  #Calculate AUC via pROC package
+  result.roc <- pROC::roc(
+    #a factor, numeric or character vector of responses, typically encoded with 0 (controls) and 1 (cases)
+    response = true_labels$group,
+    predictor = predictions$breastCancer
+  )
+  
+  #print(auc(result.roc))
+  
+  if(doublecheck){
+    #Calculate AUC via ROCR package
+    #
+    pred <- ROCR::prediction(predictions = predictions$breastCancer,
+                             labels = as.numeric(true_labels$group))
+    
+    perf <- performance(pred,"tpr","fpr")
+    Auc <- performance(pred,"auc")@y.values[[1]]
+    #return(Auc)
+    
+    #print(paste("pROC: ", round(result.roc$auc,4),
+    #            "ROCR: ", round(Auc, 4))) 
+    stopifnot(round(result.roc$auc,4) == round(Auc, 4))
+  }
+  
+  #Combine probabilty predictions with class predictions
+  class = cbind(
+    sample = as.character(rownames(test_data)), #Will be a factor otherwise
+    predicted.group = as.character(predict(fit, newdata = test_data, type="raw"))
+  )
+  
+  colnames(predictions) <- paste0("prob.",colnames(predictions))
+  
+  #Bundle results as a list of predictions and ROC
+  res <- list(predictions = cbind(class, predictions),
+              result.roc = result.roc)
+  
+  res
+}
+
+```
+
+
+## All stages: BrCa vs Healthy
+
+Using the glmnet lambda grid:
+
+```{r}
+allstages1 <- enet_auc(fit = model.glmlambda$fit,
+                      test_data = model.glmlambda$test$data,
+                      true_labels = model.glmlambda$test$labels,
+                      doublecheck = T)
+
+pROC::auc(allstages1$result.roc)
+pROC::ci.auc(allstages1$result.roc)
+```
+
+The alternate lambda grid:
+
+```{r}
+allstages2 <- enet_auc(fit = model.altlambda$fit,
+                      test_data = model.altlambda$test$data,
+                      true_labels = model.altlambda$test$labels)
+
+pROC::auc(allstages2$result.roc)
+pROC::ci.auc(allstages2$result.roc)
+```
+
+Performance is almost identical, but we pick the best.
+
+```{r}
+if(pROC::auc(allstages1$result.roc) > pROC::auc(allstages2$result.roc)){
+  allstages <- list(roc.res = allstages1$result.roc,
+                    predictions = allstages1$predictions,
+                    lambda.grid = "glmnet")
+} else {
+    allstages <- list(roc.res = allstages2$result.roc,
+                      predictions = allstages2$predictions,
+                      lambda.grid = "alt.lambda")
+}
+
+print(paste("Best lambda grid:", allstages$lambda.grid))
+```
+
+### ROC
+
+Plot the ROC with confidence intervals.
+
+```{r}
+plotmyroc <- function(roc.res, title){
+  rocobj <- plot.roc(roc.res,
+                     main = title, 
+                     percent=TRUE,
+                     #ci = TRUE,  #Finite xlim glitch 
+                     print.auc = TRUE,
+                     asp = NA)
+  
+  ciobj <- ci.se(rocobj,                         # CI of sensitivity
+                 specificities = seq(0, 1, 0.05)) # over a select set of specificities
+  plot(ciobj, type = "shape", col = "#1c61b6AA")     # plot as a blue shape
+  plot(ci(rocobj, of = "thresholds", thresholds = "best")) # add one threshold
+  
+}
+
+
+plotmyroc(allstages$roc.res, title = "Elastic net all stages")
+```
+
+### Boxplot
+
+Add metadata and labels to predictions.
+
+```{r}
+stopifnot(nrow(allstages$predictions) ==
+            nrow(dgeFiltered$samples[dgeFiltered$samples$Label %in% c("Validation"),]))
+
+allstages$predictions <- allstages$predictions %>%
+  right_join(., model.altlambda$test$labels,
+             by = c("sample"="sample_name")) %>%
+  rename(true.group = group) %>%
+  relocate(true.group, .after = predicted.group) %>%
+  left_join(., select(dgeFiltered$samples, sample = sample_name,
+                       age= Age, stage, isolationlocation),
+             by="sample")
+```
+
+
+```{r}
+allstages$predictions %>%
+  ggplot(aes(x = true.group, y = prob.breastCancer)) +
+  geom_jitter(aes(color = isolationlocation), height = 0 , width = 0.1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("Elastic net sample predictions: All stages")
+```
+
+### Write predictions
+
+Write specific per-sample predictions.
+
+```{r}
+write_csv(allstages$predictions, file = here("04_enet_sample_predictions.csv"))
+```
+
+## Early stages (I and II)
+
+Subset the validation data to stage I and II.
+
+```{r}
+#Test data and true labels are the same regardless of lambda grid
+early.val.data <- model.glmlambda$test$data[rownames(model.glmlambda$test$data) %in% earlyval.samples,]
+early.val.labels <- model.glmlambda$test$labels %>%
+  filter(sample_name %in% earlyval.samples)
+
+stopifnot(all(rownames(model.glmlambda$test$data)==rownames(model.altlambda$test$data)))
+stopifnot(all(rownames(early.val.data)==early.val.labels$sample_name))
+```
+
+Wrapper to determine which of the two lambda grids is better.
+
+```{r}
+pick_best_lambda_grid <- function(glmlambdafit, altlambdafit,
+                                  test_data, true_labels){
+  fit1 <- enet_auc(fit = glmlambdafit,
+                   test_data = test_data,
+                   true_labels = true_labels)
+  
+  #return(fit1)
+  
+  fit2 <- enet_auc(fit = altlambdafit,
+                   test_data = test_data,
+                   true_labels = true_labels)
+  
+  if(pROC::auc(fit1$result.roc) > pROC::auc(fit2$result.roc)){
+    bestfit <- list(roc.res = fit1$result.roc,
+                    predictions = fit1$predictions,
+                    lambda.grid = "glmnet")
+  } else {
+    bestfit <- list(roc.res = fit2$result.roc,
+                    predictions = fit2$predictions,
+                    lambda.grid = "alt.lambda")
+  }
+  
+  print(paste("Best lambda grid:", bestfit$lambda.grid))
+  print(pROC::auc(bestfit$roc.res))
+  print(pROC::ci.auc(bestfit$roc.res))
+  
+  return(bestfit)
+  
+}
+
+earlystage <- pick_best_lambda_grid(glmlambdafit = model.glmlambda$fit,
+                                    altlambdafit = model.altlambda$fit,
+                                    test_data = early.val.data,
+                                    true_labels = early.val.labels)
+
+```
+
+### ROC
+
+Plot the ROC with confidence intervals.
+
+```{r}
+plotmyroc(earlystage$roc.res, title = "Elastic net early stage breast cancer")
+```
+
+### Boxplot
+
+Add metadata and labels to predictions.
+
+```{r}
+earlystage$predictions <- earlystage$predictions %>%
+  inner_join(., model.altlambda$test$labels,
+             by = c("sample"="sample_name")) %>%
+  rename(true.group = group) %>%
+  relocate(true.group, .after = predicted.group) %>%
+  inner_join(., select(dgeFiltered$samples, sample = sample_name,
+                       age= Age, stage, isolationlocation),
+             by="sample")
+```
+
+```{r}
+earlystage$predictions %>%
+  ggplot(aes(x = true.group, y = prob.breastCancer)) +
+  geom_jitter(aes(color = isolationlocation), height = 0 , width = 0.1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("Elastic net sample predictions: Early stage")
+```
+
+## Late stages (III and IV)
+
+Subset the validation data to stage III and IV.
+
+```{r}
+#Test data and true labels are the same regardless of lambda grid
+late.val.data <- model.glmlambda$test$data[rownames(model.glmlambda$test$data) %in% lateval.samples,]
+late.val.labels <- model.glmlambda$test$labels %>%
+  filter(sample_name %in% lateval.samples)
+
+stopifnot(all(rownames(model.glmlambda$test$data)==rownames(model.altlambda$test$data)))
+stopifnot(all(rownames(late.val.data)==late.val.labels$sample_name))
+```
+
+Performance:
+
+```{r}
+latestage <- pick_best_lambda_grid(glmlambdafit = model.glmlambda$fit,
+                                   altlambdafit = model.altlambda$fit,
+                                   test_data = late.val.data,
+                                   true_labels = late.val.labels)
+```
+
+### ROC
+
+Plot the ROC with confidence intervals.
+
+```{r}
+plotmyroc(latestage$roc.res, title = "Elastic net late stage breast cancer")
+```
+
+### Boxplot
+
+Add metadata and labels to predictions.
+
+```{r}
+latestage$predictions <- latestage$predictions %>%
+  inner_join(., model.altlambda$test$labels,
+             by = c("sample"="sample_name")) %>%
+  rename(true.group = group) %>%
+  relocate(true.group, .after = predicted.group) %>%
+  inner_join(., select(dgeFiltered$samples, sample = sample_name,
+                       age= Age, stage, isolationlocation),
+             by="sample")
+```
+
+
+```{r}
+latestage$predictions %>%
+  ggplot(aes(x = true.group, y = prob.breastCancer)) +
+  geom_jitter(aes(color = isolationlocation), height = 0 , width = 0.1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("Elastic net sample predictions: Late stage")
+```
+
+## Confusion matrices
+
+Join the predictions with the true groups
+
+```{r}
+refactor_groups <- function(preds){
+
+  #Ensure levels are in the same order
+  preds$true.group <- factor(preds$true.group, levels=c("healthyControl", "breastCancer"))
+  preds$predicted.group <- factor(preds$predicted.group, levels = c("healthyControl", "breastCancer"))
+  
+  preds
+}
+
+
+allstages$predictions <- refactor_groups(allstages$predictions)
+earlystage$predictions <- refactor_groups(earlystage$predictions)
+latestage$predictions <- refactor_groups(latestage$predictions)
+
+
+head(allstages$predictions)
+```
+
+All stages:
+
+```{r}
+confMat <- caret::confusionMatrix(data = allstages$predictions$predicted.group,
+                                  reference = allstages$predictions$true.group,
+                                  positive = "breastCancer",
+                                  mode = "everything")
+
+confMat
+```
+
+Early stage:
+
+```{r}
+confMat_early <- caret::confusionMatrix(data = earlystage$predictions$predicted.group,
+                                        reference = earlystage$predictions$true.group,
+                                        positive = "breastCancer",
+                                        mode = "everything")
+
+confMat_early
+```
+
+Late stage:
+
+```{r}
+confMat_late <- caret::confusionMatrix(data = latestage$predictions$predicted.group,
+                                        reference = latestage$predictions$true.group,
+                                        positive = "breastCancer",
+                                        mode = "everything")
+
+confMat_late
+```
+
+## Comparison Enet vs PSO-SVM
+
+The winner between lambda grids was alt.lambda.
+
+```{r}
+allstages$lambda.grid
+earlystage$lambda.grid
+latestage$lambda.grid
+```
+
+Load the PSO results:
+
+```{r}
+pso_res <- read.csv(here("03_pso_performance_summary.csv"), row.names = 1)
+
+pso_res
+```
+
+Aggregate and compare with enet.
+
+```{r}
+df.summary <- tibble(
+  metric = pso_res$Metric,
+  PSO_brca_vs_hc = round(pso_res$PPSO_brca_vs_hc, 4),
+  Enet_brca_vs_hc = c(
+    signif(pROC::auc(allstages$roc.res), 2),
+    signif(pROC::auc(earlystage$roc.res), 2),
+    signif(pROC::auc(latestage$roc.res), 2),
+    signif(length(features.altlambda$ensembl_gene_id), 2)
+  )
+)
+
+df.summary
+```
+
+```{r}
+write.csv(df.summary,
+          here("04_enet_vs_psosvm_summary.csv")
+          )
+```
+
+Aggregate detailed enet specs:
+
+```{r}
+pretty_ci <- function(auc, conf.level = 0.95, return){
+  stopifnot(return %in% c("lower","upper","range"))
+  
+  if(return == "lower"){
+    return(signif(pROC::ci(auc, conf.level = conf.level)[1], 4))
+  }
+  
+  if(return == "upper"){
+    return(signif(pROC::ci(auc, conf.level = conf.level)[3], 4))
+  }
+  
+  if(return == "range"){
+    paste(signif(pROC::ci(auc, conf.level = conf.level)[1], 4),
+        signif(pROC::ci(auc, conf.level = conf.level)[3], 4),
+        sep="-")
+  }
+  
+}
+
+
+aucs <- list(allstages$roc.res, earlystage$roc.res, latestage$roc.res)
+confMats <- list(confMat, confMat_early, confMat_late)
+
+
+enet_detailed <- tibble(
+  Stage = c("All stages", "Early (I-II)", "Late (III-IV)"),
+  Model = "elastic net",
+  Features = nrow(features.altlambda),
+  AUC = sapply(aucs, function(x) x$auc),
+  CI.95.lower = sapply(aucs, function(x) pretty_ci(x, return = "lower")),
+  CI.95.upper = sapply(aucs, function(x) pretty_ci(x, return = "upper")),
+  Sensitivity = sapply(confMats, function(x) x$byClass[names(x$byClass)=="Sensitivity"]),
+  Specificity = sapply(confMats, function(x) x$byClass[names(x$byClass)=="Specificity"]),
+  Precision = sapply(confMats, function(x) x$byClass[names(x$byClass)=="Precision"]),
+  Recall = sapply(confMats, function(x) x$byClass[names(x$byClass)=="Recall"]),
+  F1 = sapply(confMats, function(x) x$byClass[names(x$byClass)=="F1"])
+  )
+
+
+enet_detailed
+```
+
+Write to csv:
+
+```{r}
+write_csv(enet_detailed, here("04_enet_detailed_performance.csv"))
+```
+
+Compare with PSO-SVM details:
+
+```{r}
+pso_detailed <- read_csv(here("03_pso_detailed_stats.csv"))
+```
+```{r}
+combi_detailed <- bind_rows(enet_detailed, pso_detailed)
+
+combi_detailed
+```
+
+Write comparison:
+
+```{r}
+write_csv(combi_detailed, here("04_enet_vs_psosvm_detailed.csv"))
+```
+
+```{r}
+sessionInfo()
+```

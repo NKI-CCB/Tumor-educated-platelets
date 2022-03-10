@@ -1,0 +1,1136 @@
+---
+title: "Batch correction"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    df_print: paged
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(edgeR)
+library(caret)
+library(sva)
+library(variancePartition)
+library(pROC)
+library(tidyverse)
+library(Rtsne)
+library(ggthemes)
+library(here)
+theme_set(theme_bw())
+```
+
+## Load data
+
+### Expression & metadata 
+
+For both original dataset and blind validation:
+
+```{r}
+dgeAll <- readRDS(file = here("Rds/07b_dgeAll.Rds"))
+```
+
+Hosp and ca/co breakdown:
+
+```{r}
+table(dgeAll$samples$hosp, dgeAll$samples$group)
+```
+
+Create a subset that excludes the blind validation dataset.
+
+```{r}
+dgeOriginal <- dgeAll[,dgeAll$samples$Dataset == "Original"]
+dgeOriginal$samples <- droplevels(dgeOriginal$samples)
+```
+
+### Normalization-related functions
+
+```{r}
+source(here("bin/tmm_training_norm.R"))
+```
+
+### Predictions without batch correction
+
+Used the fixed partitions previously described. From notebook 4.
+
+```{r}
+enet.nobatch <- read_csv(here("04_enet_sample_predictions.csv"))
+
+head(enet.nobatch)
+```
+
+We also want the predictions on the blind validation data, from notebook 6.
+
+```{r}
+enet_blindval <- readxl::read_excel(
+  path = here("06_predictions.xlsx"),
+  sheet = "enet_preds_fp")%>%
+  left_join(., select(dgeAll$samples, sample, true.group = group)) %>%
+  relocate(true.group, .after = predicted.group)
+
+head(enet_blindval)
+```
+
+### RUV-normalized object
+
+There are two versions of this: a version with the training data only (i.e. "original dataset"), and a version that includes the original dataset plus the blind validation samples. The inclusion of blind validation samples will affect the normalization.
+
+This is the object that contains only the original samples. The relevant list item is `ruv.counts`.
+
+```{r}
+dgeRUV <- readRDS(here("Rds","01_dgeQC.Rds"))
+
+dgeRUV %>% names()
+```
+
+Remove the excluded samples.
+
+```{r}
+dgeRUV$ruv.counts <- dgeRUV$ruv.counts[,colnames(dgeRUV$ruv.counts) %in% colnames(dgeOriginal)]
+```
+
+Include an aggregate hospital category.
+
+```{r}
+dgeRUV$samples$hosp <- ifelse(
+  dgeRUV$samples$isolationlocation %in% c("AMC", "UMCU", "VIENNA"),
+  "other", as.character(dgeRUV$samples$isolationlocation)
+  )
+
+dgeRUV$samples$hosp <- factor(dgeRUV$samples$hosp,
+                              levels = c("other", "VUMC", "MGH", "NKI"))
+
+stopifnot(nrow(filter(dgeRUV$samples, is.na(hosp))) == 0)
+```
+
+```{r}
+table(dgeRUV$samples$hosp, dgeRUV$samples$group)
+```
+
+This is the version that normalizes the blind validation samples together with the original dataset.
+
+```{r}
+dgeBlindRUV <- readRDS(here("Rds","06_dgeRUV.Rds"))
+
+#Metadata lacks hosp info, extract from dgeAll object
+dgeBlindRUV$samples <- left_join(select(dgeBlindRUV$samples, -group), #replace 0/1 encoding
+                                 select(dgeAll$samples, sample, group, hosp),
+                                 by = "sample") %>%
+  relocate(group, .before = lib.size)
+
+stopifnot(nrow(filter(dgeBlindRUV$samples, is.na(hosp))) == 0)
+stopifnot(all(colnames(dgeBlindRUV) == dgeBlindRUV$samples$sample))
+rownames(dgeBlindRUV$samples) <- colnames(dgeBlindRUV)
+stopifnot(all(colnames(dgeBlindRUV) == rownames(dgeBlindRUV$samples)))
+
+#Repair validation status
+
+
+head(dgeBlindRUV$samples)
+```
+
+For this object, the main counts slot has already been replaced with RUV counts.
+
+```{r}
+identical(dgeBlindRUV$counts, dgeBlindRUV$ruv.counts)
+```
+
+### Setup
+
+Use the same training splits as original classifier. Depicted below are the data partitions when training the particle swarm.
+
+```{r}
+table(dgeOriginal$samples$hosp, dgeOriginal$samples$Original_Label)
+```
+
+As always when running an elastic net, combine training and evaluation into a single training partition.
+
+```{r}
+dgeOriginal$samples$Label <- ifelse(
+  dgeOriginal$samples$Original_Label %in% c("Training", "Evaluation"), "Training", "Validation"
+  )
+
+table(dgeOriginal$samples$hosp, dgeOriginal$samples$Label)
+```
+
+Set up the same for RUV.
+
+```{r}
+stopifnot(all(colnames(dgeRUV) == colnames(dgeOriginal)))
+stopifnot(all(dgeOriginal$samples$hosp == dgeRUV$samples$hosp))
+
+dgeRUV$samples$Label <- dgeOriginal$samples$Label
+```
+
+### Bar chart
+
+By case-control status:
+
+```{r}
+dgeOriginal$samples %>%
+  ggplot(aes(x = Label, fill = group)) +
+  geom_bar() +
+  ggtitle("Case/control distribution in training/validation partitions") +
+  scale_fill_wsj()
+
+dgeOriginal$samples %>%
+  ggplot(aes(x = Label, fill = group)) +
+  geom_bar(position = "fill") +
+  ggtitle("Case/control distribution in training/validation partitions (percent)") +
+  scale_fill_wsj()
+```
+
+By hospital:
+
+```{r}
+dgeOriginal$samples %>%
+  ggplot(aes(x = Label, fill = hosp)) +
+  geom_bar() +
+  ggtitle("Hospital distribution in training/validation partitions") +
+  scale_fill_wsj()
+
+dgeOriginal$samples %>%
+  ggplot(aes(x = Label, fill = hosp)) +
+  geom_bar(position = "fill") +
+  ggtitle("Hospital distribution in training/validation partitions (percent)") +
+  scale_fill_wsj()
+```
+
+Hospital by case/control status (imbalanced, as discussed previously).
+
+By hospital:
+
+```{r}
+dgeOriginal$samples %>%
+  ggplot(aes(x = group, fill = hosp)) +
+  geom_bar() +
+  ggtitle("Hospital distribution by case/control status") +
+  scale_fill_wsj()
+
+dgeOriginal$samples %>%
+  ggplot(aes(x = group, fill = hosp)) +
+  geom_bar(position = "fill") +
+  ggtitle("Hospital distribution by case/control status (percent)") +
+  scale_fill_wsj()
+```
+
+## TMM/log normalization
+
+Set TMM ref and extract names of training/validation samples.
+
+```{r}
+training_samples = colnames(dgeOriginal)[dgeOriginal$samples$Label == "Training"]
+dgeOriginal$TMMref <- getTMMref(dgeOriginal, samples.for.training = training_samples)
+
+validation_samples = colnames(dgeOriginal)[dgeOriginal$samples$Label == "Validation"]
+stopifnot(all(sort(colnames(dgeOriginal)) == sort(c(training_samples, validation_samples))))
+
+bind_cols(dgeOriginal$TMMref,
+          dgeOriginal$samples[rownames(dgeOriginal$samples) == dgeOriginal$TMMref$ref.sample,])
+```
+
+Perform normalization.
+
+```{r}
+dgeOriginal$normcounts <- edgeR::cpm(
+  calcNormFactorsTraining(
+    object = dgeOriginal, method = "TMM",
+    refColumn = dgeOriginal$TMMref$col.index,
+    samples.for.training = training_samples),
+    log = T, normalized.lib.sizes = T
+  )
+```
+
+
+## ComBat on training data
+
+Create an intercept model and run ComBat
+
+```{r}
+dgeOriginal$combat <- ComBat(
+  dat=dgeOriginal$normcounts, batch=dgeOriginal$samples$hosp,
+  mod=model.matrix(~1, data=dgeOriginal$samples),
+  par.prior = T, prior.plots = F
+  )
+```
+
+### t-SNE
+
+Before batch correction
+
+```{r}
+gg_tsne <- function(mat, sampledata, col = "group", seed = 123, returndata = F){
+  
+  #A seed must be set for reproducible results
+  set.seed(seed)
+ 
+  #Input should be row observations x column variables
+  tsne <- Rtsne::Rtsne(t(mat))
+  
+  tsne_df <- data.frame(tsne_x = tsne$Y[,1], tsne_y = tsne$Y[,2])
+    
+  tsne_df <- bind_cols(tsne_df, sampledata)
+  
+  if(returndata){return(tsne_df)}
+  
+  tsne_df %>%
+    ggplot(aes(x = tsne_x, y = tsne_y, color = get(col))) +
+    geom_point() +
+    labs(color = col)
+}
+
+gg_tsne(mat=dgeOriginal$normcounts,
+        sampledata = dgeOriginal$samples,
+        col = "hosp") +
+  ggthemes::scale_color_wsj() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, without batch correction")
+
+gg_tsne(mat=dgeOriginal$normcounts,
+        sampledata = dgeOriginal$samples,
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, without batch correction")
+
+gg_tsne(mat=dgeOriginal$normcounts,
+        sampledata = dgeOriginal$samples,
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, without batch correction") +
+  facet_wrap(~hosp)
+```
+
+After batch correction
+
+```{r}
+gg_tsne(mat=dgeOriginal$combat,
+        sampledata = dgeOriginal$samples,
+        col = "hosp") +
+  ggthemes::scale_color_wsj() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, with ComBat")
+
+gg_tsne(mat=dgeOriginal$combat,
+        sampledata = dgeOriginal$samples,
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, with ComBat")
+
+gg_tsne(mat=dgeOriginal$combat,
+        sampledata = dgeOriginal$samples,
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, with ComBat") +
+  facet_wrap(~hosp)
+```
+
+### Train elastic net
+
+Train the elastic net exactly how it was trained in notebook 4. Unlike the interhospital classifiers, we do not downsample within the cross-validation loop: the data partitions include a balanced design and we wish to keep it comparable to the PSO-SVM, which also does not use downsampling.
+
+```{r}
+dgeAll$samples %>%
+  filter(sample %in% training_samples) %>%
+  select(group, Original_Label) %>% table()
+```
+
+```{r}
+enet_train <- function(
+  dge,
+  counts,
+  train_samples, #A vector matching the column names of training samples
+  val_samples, #A vector matching the column names of training samples
+  grid = expand.grid(
+    alpha = seq(0,1, by=0.1),
+    lambda = 10^seq(-4, 2, length = 100)
+    ) ,
+  sumFunc, #Use twoClassSummary for ROC or defaultSummary for kappa
+  met, #Must be a metric returned by sumFunc, ex. "ROC" or "Kappa"
+  samp = NULL, #Sampling param, should be NULL, "up", "down","rose" or "smote"
+  verboseIter = F, #Whether to print progress by fold
+  time_elapsed = T
+){
+  
+  if(sum(train_samples %in% val_samples > 0)){
+    stop("There should be no overlap between training and eval")
+  }
+  
+  start <- Sys.time()
+  
+  #Ensure that sample names don't get shuffled
+  dge$samples$sample_name <- colnames(dge)
+  stopifnot(all(dge$samples$sample_name == colnames(dge)))
+  
+  #Subset counts
+  train <- counts[, train_samples]
+  val <- counts[, val_samples]
+  
+  #Retrieve true classes
+  #For training set
+  train_true <- dge$samples %>%
+    filter(sample_name %in% colnames(train)) %>%
+    select(sample_name, group)
+  
+  #For validation set
+  val_true <- dge$samples %>%
+    filter(sample_name %in% colnames(val)) %>%
+    select(sample_name, group)
+  
+  #Ensure that column/sample names don't get shuffled (again)
+  train_true <- train_true[order(match(train_true$sample_name,colnames(train))),]
+  stopifnot(all(train_true$sample_name == colnames(train)))
+  
+  val_true <- val_true[order(match(val_true$sample_name, colnames(val))),]
+  stopifnot(all(val_true$sample_name == colnames(val)))
+  
+  #Train model
+  model <- caret::train(
+    x = t(train),
+    y = train_true$group,
+    method = "glmnet",
+    metric = met,
+    tuneGrid = grid,
+    trControl = trainControl(
+      method = "cv", number = 10,
+      verboseIter = verboseIter,
+      classProbs=TRUE,
+      summaryFunction = sumFunc,
+      #Add sampling parameter
+      sampling = samp
+    ),
+  )
+  
+  end <- Sys.time()
+  
+  if(time_elapsed){print(end-start)}
+  
+  list(fit = model,
+       train = list(data = t(train),
+                    labels = train_true),
+       test = list(data = t(val),
+                   labels = val_true)
+       )
+}
+
+set.seed(123)
+#Only rerun if the results don't already exist
+overwrite <- F
+outFile <- here("Rds", "13_combat.Rds")
+
+if(!file.exists(outFile) | overwrite == T){
+  model.combat <- enet_train(
+    dge = dgeOriginal,
+    counts = dgeOriginal$combat,
+    train_samples = training_samples, 
+    val_samples = validation_samples,
+    sumFunc = twoClassSummary,
+    met = "ROC",
+    samp = NULL,
+    verboseIter = F, 
+    time_elapsed = T
+    )
+  saveRDS(object = model.combat, file = outFile)
+} else {
+  model.combat <- readRDS(outFile)
+}
+
+model.combat$fit$bestTune
+```
+
+### Model fit plot
+
+```{r}
+ggfitplot <- function(fit, id=""){
+  
+  metric <- fit$metric
+  
+  bestPerf = fit$results %>%
+    filter(alpha == fit$bestTune$alpha,
+           lambda == fit$bestTune$lambda) %>%
+    pull(!!metric)
+  
+  #return(bestPerf)
+  
+  ggplot(fit)$data %>%
+    ggplot(aes(x = lambda, y = get(metric), color = alpha)) +
+    geom_line() +
+    scale_x_log10() +
+    ggtitle(paste0(id, " Best alpha: ", fit$bestTune$alpha,
+                   ", best lambda: ", signif(fit$bestTune$lambda, 4))) +
+    geom_point(aes(x=fit$bestTune$lambda, y=bestPerf), colour="red", shape=8) +
+    ylab(metric)
+}
+
+ggfitplot(model.combat$fit)
+```
+
+### Predictions
+
+```{r}
+enet_pred <- function(fit, val_data, mod = "elastic net"){
+  
+  class = cbind(
+    sample = colnames(val_data),
+    predicted.group = as.character(predict(fit, newdata = t(val_data), type="raw"))
+  )
+  #return(class)
+  probs = predict(fit, newdata = t(val_data), type="prob")
+  colnames(probs) <- paste0("prob.",colnames(probs))
+  probs$model <- mod
+  #return(probs)
+  df <- cbind(class, probs)
+  df$predicted.group <- factor(df$predicted.group, levels = c(
+    "healthyControl", "breastCancer"))
+  df
+  
+}
+
+perf_combat <- enet_pred(fit = model.combat$fit,
+                         val_data = t(model.combat$test$data),
+                         mod = "ComBat") %>%
+  left_join(., dgeOriginal$samples,
+            by = "sample") %>%
+  rename(real.group = group)
+
+head(perf_combat)
+```
+
+### Performance metrics
+
+```{r}
+report_performance <- function(df, dig = 4, xtable = F, mod = unique(df$model)){
+  
+  #Calculate via pROC package
+  result.roc <- pROC::roc(
+    #a factor, numeric or character vector of true labels, typically encoded with 0 (controls) and 1 (cases)
+    response = df$real.group, levels = c("healthyControl", "breastCancer"),
+    #the probability that a sample belongs to cases, typically from predict()
+    predictor = df$prob.breastCancer,
+    ci = T,
+    #Prints a helpful explicit message when it happens automatically
+    #levels = c("healthyControl", "breastCancer") #Should match the factor, where ref is first
+  )
+  #return(result.roc)
+  
+  #Ensure we standardize the levels
+  confMat <- caret::confusionMatrix(
+    data = factor(df$predicted.group, levels = c("healthyControl", "breastCancer")),
+    reference = factor(df$real.group, levels = c("healthyControl", "breastCancer")),
+    positive = "breastCancer",
+    mode="everything"
+  )
+  
+  if(xtable){return(confMat)}
+  
+  tibble(
+    model = mod,
+    AUC = round(result.roc$auc, dig),
+    CI.95 = paste(round(result.roc$ci[1], dig+1),
+                  round(result.roc$ci[3], dig+1),
+                  sep = "-"),
+    Accuracy =  round(confMat$overall[names(confMat$overall)=="Accuracy"], dig),
+    Sensitivity = round(confMat$byClass[names(confMat$byClass)=="Sensitivity"], dig),
+    Specificity = round(confMat$byClass[names(confMat$byClass)=="Specificity"], dig),
+    PPV = round(confMat$byClass[names(confMat$byClass)=="Pos Pred Value"], dig),
+    NPV = round(confMat$byClass[names(confMat$byClass)=="Neg Pred Value"], dig),
+    F1 =  round(confMat$byClass[names(confMat$byClass)=="F1"], dig),
+    Kappa =  round(confMat$overall[names(confMat$overall)=="Kappa"], dig)
+  )
+}
+report_performance(perf_combat)
+```
+
+By contrast: AUC performance for the classifier without batch correction.
+
+```{r}
+report_performance(mutate(enet.nobatch, real.group = true.group,
+                          model = "no batch correction", validation = "enet standard"))
+```
+
+### Dotplot Probability
+
+```{r}
+perf_combat %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer, color = real.group)) +
+  geom_jitter(height = 0, width = 0.2) +
+  scale_color_calc() +
+  ylim(0, 1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("Breast cancer probability post batch correction")
+```
+
+Seems like VUMC controls are less likely to be called correctly post batch correction.
+
+```{r}
+perf_combat %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer)) +
+  geom_jitter(height = 0, width = 0.2, aes(color = hosp)) +
+  scale_color_wsj() +
+  ylim(0, 1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("Breast cancer probability post batch correction, by hospital")
+```
+
+By contrast, the standard classifier without batch correction. Here VUMC controls are still called incorrectly, but the problem is more drastic.
+
+```{r}
+enet.nobatch %>%
+  left_join(., select(dgeAll$samples, sample, hosp), by = "sample") %>%
+  ggplot(aes(x = true.group, y = prob.breastCancer)) +
+  geom_jitter(aes(color = hosp), height = 0, width = 0.2) +
+  geom_boxplot(alpha = 0) +
+  scale_color_wsj() +
+  ylim(0, 1) +
+  ggtitle("Breast cancer probability of all samples within original dataset")
+```
+
+### Cross-table
+
+```{r}
+perf_combat %>%
+  report_performance(xtable = T)
+```
+
+By contrast, model performance without batch correction:
+
+```{r}
+report_performance(mutate(enet.nobatch, real.group = true.group, validation = "enet standard"),
+                   xtable = T)
+```
+
+### ROC plot
+
+```{r}
+plotmyroc <- function(df, title){
+  
+  roc.res <- pROC::roc(
+    response = df$real.group,
+    predictor = df$prob.breastCancer,
+    ci = T,
+    #Prints a helpful explicit message when it happens automatically
+    #levels = c("healthyControl", "breastCancer") #Should match the factor, where ref is first
+  )
+  
+  rocobj <- pROC::plot.roc(roc.res,
+                           main = title, 
+                           percent=TRUE,
+                           #ci = TRUE,  #Finite xlim glitch         
+                           print.auc = TRUE,
+                           print.thres = "best",
+                           asp = NA)
+  
+  ciobj <- ci.se(rocobj,                         # CI of sensitivity
+                 specificities = seq(0, 1, 0.05)) # over a select set of specificities
+  plot(ciobj, type = "shape", col = "#1c61b6AA")     # plot as a blue shape
+  plot(ci(rocobj, of = "thresholds", thresholds = "best")) # add one threshold
+}
+
+plotmyroc(perf_combat, title = "Classifer post ComBat: original data")
+```
+
+## RUV on training data
+
+Contrast RUV-corrected counts with ComBat-corrected counts.
+
+### t-SNE
+
+Before batch correction:
+
+```{r}
+gg_tsne(mat=dgeOriginal$normcounts,
+        sampledata = dgeOriginal$samples,
+        col = "hosp") +
+  ggthemes::scale_color_wsj() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, without batch correction")
+
+gg_tsne(mat=dgeOriginal$normcounts,
+        sampledata = dgeOriginal$samples,
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, without batch correction")
+```
+
+After RUV batch correction, the batch effect appears to be even worse than it was before batch correction.
+
+```{r}
+gg_tsne(mat=dgeRUV$ruv.counts,
+        sampledata = dgeRUV$samples,
+        col = "hosp") +
+  ggthemes::scale_color_wsj() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, RUV correction")
+
+gg_tsne(mat=dgeRUV$ruv.counts,
+        sampledata = dgeRUV$samples,
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, RUV correction")
+```
+
+Cancer faceted by hospital:
+
+```{r}
+gg_tsne(mat=dgeOriginal$normcounts,
+        sampledata = dgeOriginal$samples,
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, without batch correction") +
+  facet_wrap(~hosp)
+
+gg_tsne(mat=dgeRUV$ruv.counts,
+        sampledata = dgeRUV$samples,
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, RUV correction") +
+  facet_wrap(~hosp)
+```
+
+### Train elastic net
+
+```{r}
+set.seed(123)
+#Only rerun if the results don't already exist
+overwrite <- F
+outFile <- here("Rds", "13_RUV.Rds")
+
+if(!file.exists(outFile) | overwrite == T){
+  model.ruv <- enet_train(
+    dge = dgeRUV,
+    counts = dgeRUV$ruv.counts,
+    train_samples = training_samples, 
+    val_samples = validation_samples,
+    sumFunc = twoClassSummary,
+    met = "ROC",
+    samp = NULL,
+    verboseIter = F, 
+    time_elapsed = T
+    )
+  saveRDS(object = model.ruv, file = outFile)
+} else {
+  model.ruv <- readRDS(outFile)
+}
+
+model.ruv$fit$bestTune
+```
+
+```{r}
+ggfitplot(model.ruv$fit)
+```
+
+### Predictions
+
+```{r}
+perf_ruv <- enet_pred(fit = model.ruv$fit,
+                         val_data = t(model.ruv$test$data),
+                         mod = "RUV") %>%
+  left_join(., rownames_to_column(dgeRUV$samples, "sample"),
+            by = "sample") %>%
+  rename(real.group = group)
+
+head(perf_ruv)
+```
+
+### Performance metrics
+
+Performance on the training data is much better for RUV than for ComBat - this may be because RUV exacerbates the batch effect, and the signal within the data is largely batch-effect-related. We will know later on when we check performance of RUV-trained classifiers on the blind validation set.
+
+```{r}
+report_performance(perf_ruv)
+```
+
+### Dotplot Probability
+
+```{r}
+perf_ruv %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer, color = real.group)) +
+  geom_jitter(height = 0, width = 0.2) +
+  scale_color_calc() +
+  ylim(0, 1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("Breast cancer probability post RUV correction")
+```
+
+Even here we see that VUMC controls are more likely to be misclassified than other hospitals.
+
+```{r}
+perf_ruv %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer)) +
+  geom_jitter(height = 0, width = 0.2, aes(color = hosp)) +
+  scale_color_wsj() +
+  ylim(0, 1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("Breast cancer probability post RUV correction, by hospital")
+```
+
+By contrast, the standard classifier without batch correction
+
+```{r}
+enet.nobatch %>%
+  left_join(., select(dgeAll$samples, sample, hosp), by = "sample") %>%
+  ggplot(aes(x = true.group, y = prob.breastCancer)) +
+  geom_jitter(aes(color = hosp), height = 0, width = 0.2) +
+  geom_boxplot(alpha = 0) +
+  scale_color_wsj() +
+  ylim(0, 1) +
+  ggtitle("Breast cancer probability of all samples within original dataset")
+```
+
+### Cross-table
+
+```{r}
+perf_ruv %>%
+  report_performance(xtable = T)
+```
+
+By contrast, model performance without batch correction:
+
+```{r}
+report_performance(mutate(enet.nobatch, real.group = true.group, validation = "enet standard"),
+                   xtable = T)
+```
+
+### ROC plot
+
+```{r}
+plotmyroc(perf_ruv, title = "Original classifier post RUV")
+```
+
+## ComBat on blindVal
+
+Doing this requires batch correcting the blind validation with the training samples. This isn't feasible for a classifier used in the clinic, since patient samples will need to be processed one by one as patients arrive for testing, rather than in a big validation batch. However, it can be informative to look at to assess the performance of batch correction methods.
+
+### Normalization
+
+Set TMM ref. Should be the same as it was when training/testing on the original data.
+
+```{r}
+dgeAll$TMMref <- getTMMref(dgeAll, samples.for.training = training_samples)
+
+stopifnot(dgeAll$TMMref == dgeOriginal$TMMref)
+
+bind_cols(dgeAll$TMMref,
+          dgeAll$samples[rownames(dgeAll$samples) == dgeAll$TMMref$ref.sample,])
+```
+
+Select blind validation samples.
+
+```{r}
+validation_blind <- filter(dgeAll$samples, Dataset == "blindVal")$sample
+```
+
+Perform normalization.
+
+```{r}
+dgeAll$normcounts <- edgeR::cpm(
+  calcNormFactorsTraining(
+    object = dgeAll, method = "TMM",
+    refColumn = dgeAll$TMMref$col.index,
+    samples.for.training = training_samples),
+    log = T, normalized.lib.sizes = T
+  )
+```
+
+### Run ComBat
+
+```{r}
+dgeAll$combat <- ComBat(
+  dat=dgeAll$normcounts,
+  batch=dgeAll$samples$hosp,
+  mod=model.matrix(~1, data=dgeAll$samples),
+  par.prior = T, prior.plots = F
+  )
+```
+
+### t-SNE
+
+Before batch correction:
+  
+```{r}
+gg_tsne(mat=dgeAll$normcounts,
+        sampledata = dgeAll$samples,
+        col = "hosp") +
+  ggthemes::scale_color_wsj() +
+  ggtitle("t-SNE on TMM/log normalized training & validation data, without batch correction")
+```
+
+After ComBat batch correction:
+
+```{r}
+gg_tsne(mat=dgeAll$combat,
+        sampledata = dgeAll$samples,
+        col = "hosp") +
+  ggthemes::scale_color_wsj() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, ComBat correction")
+```
+
+By cancer status:
+
+```{r}
+gg_tsne(mat=dgeAll$normcounts,
+        sampledata = dgeAll$samples,
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, without batch correction")
+
+gg_tsne(mat=dgeAll$combat,
+        sampledata = dgeAll$samples,
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on TMM/log normalized original dataset, ComBat correction")
+```
+
+### Train elastic net
+
+```{r}
+set.seed(123)
+#Only rerun if the results don't already exist
+overwrite <- F
+outFile <- here("Rds", "13_blind_combat.Rds")
+
+if(!file.exists(outFile) | overwrite == T){
+  model.blind.combat <- enet_train(
+    dge = dgeAll,
+    counts = dgeAll$combat,
+    train_samples = training_samples, 
+    val_samples = validation_blind,
+    sumFunc = twoClassSummary,
+    met = "ROC",
+    samp = NULL,
+    verboseIter = F, 
+    time_elapsed = T
+  )
+  saveRDS(object = model.blind.combat, file = outFile)
+} else {
+  model.blind.combat <- readRDS(outFile)
+}
+
+model.blind.combat$fit$bestTune
+```
+
+```{r}
+ggfitplot(model.blind.combat$fit)
+```
+
+### Predictions
+
+```{r}
+perf_blind_combat <- enet_pred(fit = model.blind.combat$fit,
+                      val_data = t(model.blind.combat$test$data),
+                      mod = "ComBat ROC on Blind") %>%
+  left_join(., dgeAll$samples,
+            by = "sample") %>%
+  rename(real.group = group)
+
+head(perf_blind_combat)
+```
+
+### Performance metrics
+
+```{r}
+report_performance(perf_blind_combat)
+```
+
+### Dotplot Probability
+
+```{r}
+perf_blind_combat %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer, color = real.group)) +
+  geom_jitter(height = 0, width = 0.2) +
+  scale_color_calc() +
+  ylim(0, 1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("Breast cancer probability of blind validation data post ComBat correction")
+```
+
+By contrast, the standard classifier without batch correction when predicting on blind validation samples.
+
+```{r}
+enet_blindval %>%
+  ggplot(aes(x = true.group, y = prob.breastCancer)) +
+  geom_jitter(aes(color = true.group), height = 0, width = 0.2) +
+  geom_boxplot(alpha = 0) +
+  scale_color_few() +
+  ylim(0, 1) +
+  ggtitle("Breast cancer probability of blind validation samples without batch correction")
+```
+
+### Cross-table
+
+```{r}
+perf_blind_combat %>%
+  report_performance(xtable = T)
+```
+
+By contrast, model performance without batch correction:
+  
+```{r}
+report_performance(mutate(enet_blindval, real.group = true.group,
+                          validation = "enet standard on blindval"), xtable = T)
+```
+
+### ROC plot
+
+```{r}
+plotmyroc(perf_blind_combat, title = "Performance on blind validation post ComBat")
+```
+
+## RUV on blindVal
+
+The same caveats for ComBat on the blind validation samples apply here: It requires batch correcting the blind validation together with the training samples. This isn't a viable strategy for a classifier deployed in the clinic, but it can be informative for investigating batch correction methods.
+
+Set TMM ref. May not be the same as it was when training/testing on the original data due to RUV correction.
+
+```{r}
+dgeBlindRUV$TMMref <- getTMMref(dgeBlindRUV, samples.for.training = training_samples)
+
+bind_cols(dgeBlindRUV$TMMref,
+          dgeBlindRUV$samples[rownames(dgeBlindRUV$samples) == dgeBlindRUV$TMMref$ref.sample,])
+```
+
+### t-SNE
+
+Before batch correction:
+  
+```{r}
+gg_tsne(mat=dgeAll$normcounts,
+        sampledata = dgeAll$samples,
+        col = "hosp") +
+  ggthemes::scale_color_wsj() +
+  ggtitle("t-SNE on TMM/log normalized training & validation data, without batch correction")
+```
+
+After RUV batch correction:
+
+```{r}
+gg_tsne(mat=dgeBlindRUV$ruv.counts,
+        sampledata = dgeBlindRUV$samples,
+        col = "hosp") +
+  ggthemes::scale_color_wsj() +
+  ggtitle("t-SNE on TMM/log normalized training & validation data, RUV correction")
+```
+
+### Train elastic net
+
+```{r}
+set.seed(123)
+#Only rerun if the results don't already exist
+overwrite <- F
+outFile <- here("Rds", "13_blind_RUV.Rds")
+
+if(!file.exists(outFile) | overwrite == T){
+  model.blind.ruv <- enet_train(
+    dge = dgeBlindRUV,
+    counts = dgeBlindRUV$ruv.counts,
+    train_samples = training_samples, 
+    val_samples = validation_blind,
+    sumFunc = twoClassSummary,
+    met = "ROC",
+    samp = NULL,
+    verboseIter = F, 
+    time_elapsed = T
+  )
+  saveRDS(object = model.blind.ruv, file = outFile)
+} else {
+  model.blind.ruv <- readRDS(outFile)
+}
+
+model.blind.ruv$fit$bestTune
+```
+
+```{r}
+ggfitplot(model.blind.ruv$fit)
+```
+
+### Predictions
+
+```{r}
+perf_blind_ruv <- enet_pred(fit = model.blind.ruv$fit,
+                      val_data = t(model.blind.ruv$test$data),
+                      mod = "RUV ROC on blindval") %>%
+  left_join(., dgeBlindRUV$samples,
+            by = "sample") %>%
+  rename(real.group = group)
+
+head(perf_blind_ruv)
+```
+
+### Performance metrics
+
+```{r}
+report_performance(perf_blind_ruv)
+```
+
+### Dotplot Probability
+
+```{r}
+perf_blind_ruv %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer, color = real.group)) +
+  geom_jitter(height = 0, width = 0.2) +
+  scale_color_calc() +
+  ylim(0, 1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("Breast cancer probability of blind validation samples post RUV correction")
+```
+
+By contrast, the standard classifier without batch correction
+
+```{r}
+enet_blindval %>%
+  ggplot(aes(x = true.group, y = prob.breastCancer)) +
+  geom_jitter(aes(color = true.group), height = 0, width = 0.2) +
+  geom_boxplot(alpha = 0) +
+  scale_color_few() +
+  ylim(0, 1) +
+  ggtitle("Breast cancer probability of blind validation samples without batch correction")
+```
+
+### Cross-table
+
+```{r}
+perf_blind_ruv %>%
+  report_performance(xtable = T)
+```
+
+By contrast, model performance without batch correction:
+  
+```{r}
+report_performance(mutate(enet_blindval, real.group = true.group, validation = "enet standard"), xtable = T)
+```
+
+### ROC plot
+
+```{r}
+plotmyroc(perf_blind_ruv, title = "Blind validation performance post RUV correction")
+```
+
+## Summary batch correction
+
+```{r}
+batch_summary <- bind_rows(
+  mutate(report_performance(perf_combat),
+         method = "ComBat",
+         validation = "cross validation",
+         .before = everything()),
+  mutate(report_performance(perf_ruv),
+         method = "RUV",
+         validation = "cross validation",
+         .before = everything()),
+  mutate(report_performance(perf_blind_combat),
+         method = "ComBat",
+         validation = "blind validation",
+         .before = everything()),
+  mutate(report_performance(perf_blind_ruv),
+         method = "RUV",
+         validation = "blind validation",
+         .before = everything())
+) %>% rename(validation_data = model)
+
+batch_summary
+write_csv(batch_summary, here("13_batch_summary.csv"))
+```
+
+```{r}
+sessionInfo()
+```

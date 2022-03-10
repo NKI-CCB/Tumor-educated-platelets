@@ -1,0 +1,651 @@
+---
+title: "Erythrocyte and lymphocyte contamination"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    df_print: paged
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(DESeq2)
+library(edgeR)
+library(here)
+library(ggthemes)
+library(tidyverse)
+
+theme_set(theme_bw())
+```
+
+All pellets used in the blind validation assay were scored for redness by Marte Liefaard based on remaining samples within the NKI's storage facility. We can attempt to assess erythrocyte contamination via hemoglobin subunits, and lymphocyte contamination via CD3. Note that neither of these measures are definitive, given that TEPs absorb RNA from their environment. The presence of these transcripts may therefore not represent contamination, but accurate TEP biology.
+
+## Load data
+
+### Pellet redness data
+
+```{r}
+erydf <- readxl::read_excel(here("dataset/third_party_val/20201217_NKI_ValSet_VU_ID_merged_redness_complete.xlsx"))
+
+head(erydf)
+```
+
+Relevant column is Redness. Encode color.
+
+```{r}
+erydf <- erydf %>%
+  mutate(Color = case_when(
+    Redness == 0 ~ "white",
+    Redness == 1 ~ "pink",
+    Redness == 2 ~ "red"
+  ), .after=Redness) %>%
+  mutate(Color = factor(Color, levels = c("white", "pink", "red")))
+```
+
+### Gene expression data
+
+There is a standalone dgeVal object, but we never added gene info to it. So we'll load dgeAll and subset.
+
+```{r}
+dgeAll <- readRDS(here("Rds/07b_dgeAll.Rds"))
+dgeVal <- dgeAll[,dgeAll$samples$Dataset == "blindVal"]
+```
+
+The VUMC altered the Sequence_IDs a bit. Standardize.
+
+```{r}
+erydf <- erydf %>% 
+  mutate(sample = str_replace(Sequence_ID, "Marte_breast", "BREAST"))
+
+table(erydf$sample %in% dgeVal$samples$sample)
+```
+
+The few that are missing are those that never got sequenced.
+
+```{r}
+erydf %>%
+  select(Sequence_ID, sample) %>%
+  filter(!sample %in% dgeVal$samples$sample)
+```
+
+Arrange in order so we can add to `dgeVal`.
+
+```{r}
+erydf <- erydf[match(dgeVal$samples$sample, erydf$sample),]
+
+stopifnot(all(erydf$sample == dgeVal$samples$sample))
+
+dgeVal$samples$Redness <- erydf$Redness
+dgeVal$samples$Color <- erydf$Color
+dgeVal$samples$Year_drawn <- erydf$Afname_jaar
+dgeVal$samples$VUPSO_correct <- erydf$VUPSO_correct
+dgeVal$samples$VU_S3_breastCancer <- erydf$VU_S3_breastCancer
+```
+
+### Classifier predictions
+
+Load the classifier predictions from cross-validation on the original samples, so that we can see which samples were misclassified. This is from the version with fixed data partitions.
+
+```{r}
+enet_original <- read_csv(here("04_enet_sample_predictions.csv"))
+
+head(enet_original)
+```
+
+Also take in those for the blind validation set.
+
+```{r}
+enet_blindval <- readxl::read_excel(here("06_predictions.xlsx"), sheet = "enet_preds_fp")
+
+head(enet_blindval)
+```
+
+Add the true class labels.
+
+```{r}
+enet_blindval <- select(read_csv(here("07_validated_sample_dictionary.csv")),
+       sample, real.group = Status_description) %>%
+  mutate(real.group = ifelse(real.group == "Case", "breastCancer", "healthyControl")) %>%
+  left_join(enet_blindval, ., by = "sample")
+
+head(enet_blindval)
+```
+
+Combine both, and add a misclassified column.
+
+```{r}
+enet_preds <- bind_rows(
+  enet_original %>%
+    select(sample, real.group = true.group, enet.prediction = predicted.group,
+           enet.prob.brca = prob.breastCancer, enet.prob.hc = prob.healthyControl),
+  enet_blindval %>%
+    select(sample, real.group, enet.prediction = predicted.group,
+           enet.prob.brca = prob.breastCancer, enet.prob.hc = prob.healthyControl)
+) %>%
+  mutate(misclassified = (real.group != enet.prediction), .after = enet.prediction)
+
+enet_preds %>% head()
+```
+
+Sanity check: All of the validation samples in the fixed data partitions should have prediction values.
+There should also NOT be any samples from the training and evaluation partitions in the prediction list (these partitions were combined to train the elastic net).
+
+```{r}
+stopifnot(nrow(filter(dgeAll$samples, Original_Label == "Validation") %>%
+  filter(!sample %in% enet_preds$sample)) == 0)
+
+stopifnot(nrow(filter(dgeAll$samples, Original_Label %in% c("Training", "Evaluation")) %>%
+  filter(sample %in% enet_preds$sample)) == 0)
+```
+
+Create a new DGEList that contains the elastic net predictions as metadata and perform some more sanity checks.
+
+```{r}
+dgePred <- dgeAll
+
+dgePred$samples <- dgePred$samples %>%
+  left_join( ., enet_preds, by = "sample") %>%
+  #filter(real.group != group) #Manual check, should be 0 rows
+  select(-real.group) %>%
+  relocate(group, enet.prediction, lib.size, norm.factors, .after = sample) %>%
+  as.data.frame()
+
+stopifnot(all(colnames(dgePred) == dgePred$samples$sample))
+
+rownames(dgePred$samples) <- dgePred$samples$sample
+
+stopifnot(all(colnames(dgePred) == rownames(dgePred$samples)))
+stopifnot(nrow(
+  filter(dgePred$samples,
+         (Original_Label == "Validation" | Dataset == "blindVal") & is.na(enet.prediction))
+  ) == 0)
+
+```
+
+Save for (potential) later use.
+
+```{r}
+saveRDS(dgePred, here("Rds/14_dgePred.Rds"))
+```
+
+Misclassifications by hospital:
+
+```{r}
+table(filter(dgePred$samples, !is.na(enet.prediction))$hosp,
+      filter(dgePred$samples, !is.na(enet.prediction))$misclassified)
+```
+
+### Subset original data
+
+Create DGEList that excludes blind validation set.
+
+```{r}
+dgeOriginal <- dgeAll[,dgeAll$samples$Dataset == "Original"]
+dgeOriginal$samples <- droplevels(dgeOriginal$samples)
+dgeOriginal$samples$lib.size <- colSums(dgeOriginal$counts)
+table(dgeOriginal$samples$isolationlocation, dgeOriginal$samples$hosp) %>% addmargins()
+```
+
+## Basic pellet color plots
+
+By year:
+
+```{r}
+erydf %>%
+  ggplot(aes(x = Afname_jaar, fill = Color)) +
+  geom_bar() +
+  scale_fill_manual(values = c(
+    "white" = "lightgray",
+    "pink" = "pink",
+    "red" = "red"
+  )) +
+  ggtitle("Pellet color by year")
+```
+
+By classification accuracy from the VU PSO
+
+```{r}
+erydf %>%
+  filter(VUPSO_correct != 9) %>% #These samples were excluded
+  ggplot(aes(x = as.factor(VUPSO_correct), fill = Color)) +
+  geom_bar() +
+  scale_fill_manual(values = c(
+    "white" = "lightgray",
+    "pink" = "pink",
+    "red" = "red"
+  )) +
+  ggtitle("Pellet color by classification accuracy") +
+  xlab("VUPSO correct classification")
+```
+
+```{r}
+erydf %>%
+  filter(VUPSO_correct != 9) %>% #These samples were excluded
+  ggplot(aes(x = as.factor(Status_description), y = VU_S3_breastCancer, color = Color)) +
+  #geom_jitter() +
+  geom_boxplot() +
+  scale_color_manual(values = c(
+    "white" = "gray",
+    "pink" = "pink",
+    "red" = "red"
+  )) +
+  ggtitle("Pellet color by predicted cancer probability") +
+  xlab("VUPSO cancer probability")
+```
+
+## Histogram gene expression
+
+Histogram of general counts, for contextualizing levels of potential confounding genes.
+
+```{r}
+hist(edgeR::cpm(edgeR::calcNormFactors(dgeAll$counts),
+                log = T, normalized.lib.sizes = T),
+     main = "Histogram of genes passing minimum count threshold",
+     xlab = "Log transformed normalized expression")
+```
+
+## Hemoglobin
+
+```{r}
+heme_genes <- c("HBA", "HBB", "HBG1", "HBG2", "HBA1", "HBA2", "HBE1") 
+
+tibble(heme_genes = heme_genes, detected_in_TEPs = heme_genes %in% dgeVal$genes$hgnc_symbol)
+```
+
+```{r}
+genePlot <- function(dge, gene, xby = "group", colorby = "Color"){
+  
+  stopifnot(colorby %in% c("Color"))
+  #stopifnot(xby %in% c("group","Year_drawn", "VUPSO_correct", "VU_S3_breastCancer", "Color"))
+  
+  #Normalized count matrix
+  mat = edgeR::cpm(edgeR::calcNormFactors(dge),
+                   log = T, normalized.lib.sizes = T)
+  
+  geneInfo = dge$genes[dge$genes$hgnc_symbol == gene,]
+  stopifnot(nrow(geneInfo)==1)
+  
+  mat = mat[rownames(mat)==geneInfo$ensembl_gene_id,]
+  df = enframe(mat, "sample_name", "normcount")
+  
+  sd <- dge$samples %>%
+    rownames_to_column("sample_name")
+  
+  df <- left_join(df, select(sd, "sample_name", "group", "Color", "Redness",
+                             "Year_drawn","VUPSO_correct","VU_S3_breastCancer"),
+            by = "sample_name") %>%
+    mutate(Year_drawn = as.factor(Year_drawn),
+           VUPSO_correct = as.factor(VUPSO_correct))
+  
+  if(xby %in% c("VU_S3_breastCancer", "Redness")){
+    p <- ggplot(df, aes(x = get(xby), y = normcount, color = Color)) +
+      geom_point(aes(color = get(colorby))) +
+      labs(color = colorby) +
+      xlab(xby) +
+      ggtitle(paste(gene, "by", xby, "and pellet color")) +
+      scale_color_manual(values = c(
+        "white" = "gray",
+        "pink" = "pink",
+        "red" = "red"
+      ))
+    return(p)
+  }
+  
+  ggplot(df, aes(x = get(xby), y = normcount)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(color = get(colorby)), height = 0, width = 0.2) +
+    labs(color = colorby) +
+    xlab(xby) +
+    ggtitle(paste(gene, "by", xby, "and pellet color")) +
+    scale_color_manual(values = c(
+    "white" = "gray",
+    "pink" = "pink",
+    "red" = "red"
+  ))
+}
+```
+
+### Pellet color
+
+HBB
+
+```{r}
+lapply(c("Color", "group", "Year_drawn", "VUPSO_correct", "VU_S3_breastCancer"),
+       function(x) genePlot(dge = dgeVal, gene = "HBB", xby = x, colorby="Color"))
+```
+
+HBG2
+
+```{r}
+lapply(c("Color", "group", "Year_drawn", "VUPSO_correct", "VU_S3_breastCancer"),
+       function(x) genePlot(dge = dgeVal, gene = "HBG2", xby = x, colorby="Color"))
+```
+
+### PCA by pellet color
+
+Normalize counts.
+
+```{r}
+normVal <- cpm(calcNormFactors(dgeVal), log = T)
+```
+
+Wrapper functions for PCA.
+
+```{r}
+scree_plot = function(res_prcomp = nc.pca, n_pca=20, returnData = F){
+  
+  require(tidyverse)
+  
+  percentVar <- res_prcomp$sdev^2/sum(res_prcomp$sdev^2) * 100
+  names(percentVar) = paste0("PC", seq(1, length(percentVar)))
+  percentVar = enframe(percentVar, "PC", "variance")
+  
+  percentVar$PC=factor(percentVar$PC, levels=percentVar$PC)
+  if(returnData){return(percentVar)}
+  percentVar %>%
+    dplyr::slice(1:n_pca) %>%
+    ggplot(aes(x=PC, y=variance)) +
+    geom_bar(stat="identity") +
+    ggtitle("Scree plot") +
+    ylab("Percent total variance") +
+    theme_bw()
+  
+}
+
+#For extracting percent variance associated with a PC
+get_var <- function(PC, x){
+  p = x[x$PC == PC, ]$variance
+  paste0(round(p, 1), "%")
+}
+#get_var("PC1")
+
+#Plot PCAs with ggplots2, color mandatory, shape optional
+gg_pca <- function(pca.df, x.pc, y.pc, pVar,
+                   color.var, shape.var=NULL,
+                   palette = "Dark2", title=""){
+  
+  ncolors <- length(unique(pca.df[,color.var]))
+  
+  if(is.null(shape.var)){
+    ggplot(pca.df, aes(x=get(x.pc), y=get(y.pc),
+                       color=get(color.var))) +
+      geom_point()  + 
+      #scale_color_manual(values = colorRampPalette(brewer.pal(8, palette))(ncolors)) +
+      ggtitle(title) +
+      theme_bw() +
+      xlab(paste0(x.pc, ": ", get_var(x.pc,x = pVar))) +
+      ylab(paste(y.pc, ": ", get_var(y.pc,x = pVar))) +
+      labs(color = color.var)
+  } else {
+    ggplot(pca.df, aes(x=get(x.pc), y=get(y.pc),
+                       color=get(color.var),
+                       shape=get(shape.var))) +
+      geom_point()  + 
+      #scale_color_manual(values = colorRampPalette(brewer.pal(8, palette))(ncolors)) +
+      ggtitle(title) +
+      theme_bw() +
+      xlab(paste0(x.pc, ": ", get_var(PC = x.pc, x = pVar))) +
+      ylab(paste(y.pc, ": ", get_var(y.pc,x = pVar))) +
+      labs(color = color.var, shape = shape.var)
+  }
+}
+
+ggpca <- function(mat, dge = dgeVal, cvar = "group", svar = NULL){
+  thisnc.pca <- prcomp(t(mat))
+  thispercVar <- scree_plot(res_prcomp = thisnc.pca, n_pca=20, returnData = T)
+  
+  #Sometimes less than 100 PCs are returned
+  pcmax <- ifelse(ncol(thisnc.pca$x) < 100, ncol(thisnc.pca$x), 100)
+  
+  thispca.df <- as.data.frame(thisnc.pca$x[, 1:pcmax]) %>%
+    rownames_to_column("sample")
+  thispca.df <- right_join(dge$samples,thispca.df, by='sample')
+  #return(thispca.df)
+  gg_pca(pca.df = thispca.df, x.pc = "PC1", y.pc = "PC2", pVar = thispercVar,
+       color.var = cvar, shape.var = svar)
+}
+
+ggpca(normVal, cvar = "Color")+
+    scale_color_manual(values = c(
+    "white" = "gray",
+    "pink" = "pink",
+    "red" = "red"
+  )) +
+  ggtitle("PCA blind validation set by pellet color")
+```
+
+### Boxplot hospital
+
+```{r}
+genePlot <- function(dge, gene, xby = "hosp", colorby = "group"){
+  
+  stopifnot(colorby %in% colnames(dge$samples))
+  
+  #Normalized count matrix
+  mat = edgeR::cpm(edgeR::calcNormFactors(dge),
+                   log = T, normalized.lib.sizes = T)
+  
+  geneInfo = dge$genes[dge$genes$hgnc_symbol == gene,]
+  stopifnot(nrow(geneInfo)==1)
+  
+  mat = mat[rownames(mat)==geneInfo$ensembl_gene_id,]
+  df = enframe(mat, "sample_name", "normcount")
+  
+  sd <- dge$samples %>%
+    rownames_to_column("sample_name")
+  
+  df <- left_join(df, sd,
+            by = "sample_name")
+  
+  if(colorby %in% c("ery_contam", "pellet_qual")){
+    df$f <- df[,colorby]
+    df <- df %>% filter(!is.na(f))
+    df$hosp <- droplevels(df$hosp)
+  }
+  
+  #return(df)
+  ggplot(df, aes(x = get(xby), y = normcount)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(color = get(colorby)), height = 0, width = 0.2) +
+    labs(color = colorby) +
+    xlab(xby) +
+    ggtitle(paste(gene, "by", xby))
+}
+
+genePlot(dge = dgeAll, gene = "HBB") +
+  ggthemes::scale_color_calc()
+
+genePlot(dge = dgeAll, gene = "HBG2") +
+  ggthemes::scale_color_calc()
+```
+
+### Boxplot misclassifications
+
+Hosp x, classification color:
+
+```{r}
+#Exclude samples used to train the enet/pso
+genePlot(dge = dgePred[,!dgePred$samples$Original_Label %in% c("Training", "Evaluation")],
+         gene = "HBB", colorby = "misclassified") +
+  ggthemes::scale_color_colorblind()
+
+genePlot(dge = dgePred[,!dgePred$samples$Original_Label %in% c("Training", "Evaluation")],
+         gene = "HBG2", colorby = "misclassified") +
+  ggthemes::scale_color_colorblind()
+```
+
+Classification status x, hosp color:
+
+```{r}
+genePlot(dge = dgePred[,!is.na(dgePred$samples$enet.prediction)],
+         gene = "HBB", colorby = "hosp", xby = "misclassified") +
+  scale_color_few() +
+  ggtitle("HBB by classification status") +
+  facet_wrap(~Dataset) +
+  ggpubr::stat_compare_means(comparisons = list(c("FALSE", "TRUE")))
+
+genePlot(dge = dgePred[,!is.na(dgePred$samples$enet.prediction)],
+         gene = "HBG2", colorby = "hosp", xby = "misclassified") +
+  scale_color_few() +
+  ggtitle("HBG2 by classification status")+
+  facet_wrap(~Dataset)+
+  ggpubr::stat_compare_means(comparisons = list(c("FALSE", "TRUE")))
+```
+
+### Dotplot cancer probability
+
+No meaningful correlation.
+
+```{r}
+probPlot <- function(dge, gene, colorby = "misclassified"){
+  
+  stopifnot(colorby %in% colnames(dge$samples))
+  
+  #Normalized count matrix
+  mat = edgeR::cpm(edgeR::calcNormFactors(dge),
+                   log = T, normalized.lib.sizes = T)
+  
+  geneInfo = dge$genes[dge$genes$hgnc_symbol == gene,]
+  stopifnot(nrow(geneInfo)==1)
+  
+  mat = mat[rownames(mat)==geneInfo$ensembl_gene_id,]
+  df = enframe(mat, "sample_name", "normcount")
+  
+  sd <- dge$samples %>%
+    rownames_to_column("sample_name")
+  
+  df <- left_join(df, sd,
+            by = "sample_name")
+
+  #return(df)
+  ggplot(df, aes(x = enet.prob.brca, y = normcount)) +
+    geom_point(aes(color = get(colorby))) +
+    labs(color = colorby) +
+    ggtitle(paste(gene, "expression by predicted breast cancer probability"))
+}
+
+probPlot(dgePred[,!is.na(dgePred$samples$enet.prediction)], gene = "HBB") +
+  scale_color_colorblind()
+
+probPlot(dgePred[,!is.na(dgePred$samples$enet.prediction)], gene = "HBG2") +
+  scale_color_colorblind()
+```
+
+## CD3
+
+### Boxplot hospital
+
+```{r}
+genePlot(dge = dgeAll, gene = "CD3D") +
+  ggthemes::scale_color_calc()
+
+genePlot(dge = dgeAll, gene = "CD3E") +
+  ggthemes::scale_color_calc()
+
+```
+
+### Boxplot misclassifications
+
+Hosp x, classification color:
+
+```{r}
+#Exclude samples used in enet/pso training (no predictions)
+genePlot(dge = dgePred[,!dgePred$samples$Original_Label %in% c("Training", "Evaluation")],
+         gene = "CD3D", colorby = "misclassified") +
+  ggthemes::scale_color_colorblind()
+
+genePlot(dge = dgePred[,!dgePred$samples$Original_Label %in% c("Training", "Evaluation")],
+         gene = "CD3E", colorby = "misclassified") +
+  ggthemes::scale_color_colorblind()
+```
+
+Classification status x, hosp color:
+
+```{r}
+genePlot(dge = dgePred[,!is.na(dgePred$samples$enet.prediction)],
+         gene = "CD3D", colorby = "hosp", xby = "misclassified") +
+  scale_color_few() +
+  ggtitle("CD3D by classification status") +
+  facet_wrap(~Dataset)+
+  ggpubr::stat_compare_means()
+  #ggpubr::stat_compare_means(comparisons = list(c("FALSE", "TRUE")))
+
+genePlot(dge = dgePred[,!is.na(dgePred$samples$enet.prediction)],
+         gene = "CD3E", colorby = "hosp", xby = "misclassified") +
+  scale_color_few() +
+  ggtitle("CD3E by classification status") +
+  facet_wrap(~Dataset)+
+  ggpubr::stat_compare_means()
+  #ggpubr::stat_compare_means(comparisons = list(c("FALSE", "TRUE")))
+```
+
+### Dotplot cancer probablity
+
+```{r}
+probPlot(dgePred[,!is.na(dgePred$samples$enet.prediction)], gene = "CD3D") +
+  scale_color_colorblind()
+
+probPlot(dgePred[,!is.na(dgePred$samples$enet.prediction)], gene = "CD3E") +
+  scale_color_colorblind()
+```
+
+## CD45/PTPRC
+
+Platelets can and do express CD3 [source](https://ashpublications.org/blood/article/112/11/5363/62984/Human-Platelets-Express-and-Synthesize-CD3-Chain). It may therefore be more effective to look at [PTPRC/CD45 transcripts to assess leukocyte contamination](https://ashpublications.org/blood/article/134/12/911/374913/Sepsis-alters-the-transcriptional-and).
+
+### Boxplot hospital
+
+```{r}
+genePlot(dge = dgeAll, gene = "PTPRC") +
+  ggthemes::scale_color_calc()
+```
+
+### Boxplot misclassifications
+
+Hosp x, classification color:
+
+```{r}
+#Exclude samples used to train the enet/pso, as they don't have predictions
+genePlot(dge = dgePred[,!dgePred$samples$Original_Label %in% c("Training", "Evaluation")],
+         gene = "PTPRC", colorby = "misclassified") +
+  ggthemes::scale_color_colorblind()
+```
+
+Classification status x, hosp color:
+
+```{r}
+genePlot(dge = dgePred[,!is.na(dgePred$samples$enet.prediction)],
+         gene = "PTPRC", colorby = "hosp", xby = "misclassified") +
+  scale_color_few() +
+  ggtitle("PTPRC by classification status") +
+  facet_wrap(~Dataset)+
+  ggpubr::stat_compare_means()
+  #ggpubr::stat_compare_means(comparisons = list(c("FALSE", "TRUE")))
+```
+
+Original samples only:
+
+```{r}
+genePlot(dge = dgePred[,!is.na(dgePred$samples$enet.prediction) & dgePred$samples$Dataset != "blindVal"],
+         gene = "PTPRC", colorby = "group", xby = "misclassified") +
+  scale_color_calc() +
+  ggtitle("PTPRC by classification status, excluding blindVal") +
+  ggpubr::stat_compare_means(label.x.npc = "center") #+
+  #ggpubr::stat_compare_means(comparisons = list(c("FALSE", "TRUE")),
+  #                           label = "p.signif")
+```
+
+### Dotplot cancer probablity
+
+```{r}
+probPlot(dgePred[,!is.na(dgePred$samples$enet.prediction)], gene = "PTPRC") +
+  scale_color_colorblind()
+```
+
+```{r}
+sessionInfo()
+```

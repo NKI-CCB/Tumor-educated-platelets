@@ -1,0 +1,614 @@
+---
+title: "Post hoc analyses: dimensionality"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    df_print: paged
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+library(edgeR)
+library(vsn)
+library(DESeq2)
+library(here)
+library(caret)
+library(ComplexHeatmap)
+library(Rtsne)
+library(umap)
+library(pROC)
+library(tidyverse)
+library(ggthemes)
+library(ggsci)
+
+theme_set(theme_bw())
+```
+
+The performance of all TEP-based classifiers on the blind validation set was much poorer than expected.
+In this notebook, we will explore possible explanations for the poor performance, focusing on dimensionality analyses. 
+
+## Load data
+
+Expression & metadata for both original dataset and blind validation:
+
+```{r}
+dgeAll <- readRDS(file = here("Rds/07b_dgeAll.Rds"))
+```
+
+Create subsets for original data and blind val:
+
+```{r}
+dgeOriginal <- dgeAll[,dgeAll$samples$Dataset == "Original"]
+dgeOriginal$samples <- droplevels(dgeOriginal$samples)
+
+dgeBlindVal <- dgeAll[,dgeAll$samples$Dataset == "blindVal"]
+dgeBlindVal$samples <- droplevels(dgeBlindVal$samples)
+```
+
+Elastic net model, from which we extract the features
+
+```{r}
+model_altlambda <- readRDS(here("Rds/04_model_altlambda.Rds"))
+
+feature_extraction <- function(fit, dict = dgeAll$genes){
+   coef(fit$finalModel, fit$bestTune$lambda) %>%
+    as.matrix() %>% as.data.frame() %>%
+    slice(-1) %>% #Remove intercept
+    rownames_to_column("feature") %>%
+    rename(coef = "1") %>%
+    filter(coef !=0) %>%
+    left_join(., dict, by = c("feature" = "ensembl_gene_id")) %>%
+    rename("ensembl_gene_id"=feature) %>%
+    arrange(desc(abs(coef)))
+}
+
+enet_feat <- feature_extraction(model_altlambda$fit)
+```
+
+Total number of elastic net features in the final version:
+
+```{r}
+enet_feat %>% nrow()
+```
+
+PSO-SVM model & features:
+
+```{r}
+pso_output <- readRDS(here("Rds/02_thromboPSO.Rds"))
+
+best.selection.pso <- paste(pso_output$lib.size,
+                            pso_output$fdr,
+                            pso_output$correlatedTranscripts,
+                            pso_output$rankedTranscripts, sep="-")
+
+particle_path <- file.path(here("pso-enhanced-thromboSeq1/outputPSO", 
+                           paste0(best.selection.pso,".RData")))
+
+load(particle_path) #Becomes dgeTraining
+dgeParticle <- dgeTraining #Rename to avoid namespace confusion
+rm(dgeTraining)
+
+
+#Features from PSO-SVM do not have coefficients, 
+#but they should come out of Thromboseq in a ranked order.
+
+psosvm.feat <- enframe(dgeParticle$biomarker.transcripts, "rank", "ensembl_gene_id") %>%
+  left_join(dgeParticle$genes, by = "ensembl_gene_id")
+```
+
+Number of PSO-SVM features:
+
+```{r}
+psosvm.feat %>% nrow()
+```
+
+## PCA
+
+For PCA we want to render the data homoskedastic: that is, the variances should be mostly the same and not dependent on large counts.
+We have three possible ways of doing this:
+
+a) voom transformation
+b) log-transformed TMM counts
+c) variance stabilizing transformation
+
+```{r}
+v <- limma::voom(dgeAll, design = model.matrix(~group, dgeAll$samples), plot = F)
+normTMMlog2 <- function(object){
+  object = calcNormFactors(object, method="TMM")
+  object = cpm(object, log=T, normalized.lib.sizes=T)
+  return(object)
+}
+
+normAll <- normTMMlog2(dgeAll)
+vsdAll <- DESeqDataSetFromMatrix(countData = dgeAll$counts,
+                                 colData = dgeAll$samples,
+                                 design = ~1) %>%
+  vst(., blind=T)
+```
+
+### Mean-sd plots
+
+Plot the mean by the standard deviation. We want to see as straight a line as possible.
+
+```{r}
+#Need to set plot=F and then access gg to add a title
+vsn::meanSdPlot(v$E, plot=F)$gg + ggtitle("Voom")
+vsn::meanSdPlot(normAll, plot=F)$gg + ggtitle("Log TMM")
+vsn::meanSdPlot(assay(vsdAll), plot=F)$gg + ggtitle("Vst")
+```
+
+Of the three, voom is clearly the worst. TMM and VST are pretty close. We'll go with TMM, because the rest of the classifiers have been trained on TMM-normalized data, and the dimensionality analyses resulting from a TMM-based strategy will be closest to what the classifier "sees".
+
+Note: in the previous analysis, we used VST instead of TMM. As such, these visualizations will look a little different than they do in `pso-vs-hc`.
+
+```{r, include=F}
+#Remove the unused objects:
+rm(vsdAll)
+rm(v)
+```
+
+Normalize the subsetted objects:
+
+```{r}
+normBlind <- normTMMlog2(dgeBlindVal)
+normOriginal <- normTMMlog2(dgeOriginal)
+```
+
+Set up some functions for computing & plotting PCAs.
+
+```{r}
+#Will return a data frame instead of a plot if returnData is TRUE
+scree_plot = function(res_prcomp = nc.pca, n_pca=20, returnData = F){
+  
+  percentVar <- res_prcomp$sdev^2/sum(res_prcomp$sdev^2) * 100
+  names(percentVar) = paste0("PC", seq(1, length(percentVar)))
+  percentVar = enframe(percentVar, "PC", "variance")
+  
+  percentVar$PC=factor(percentVar$PC, levels=percentVar$PC)
+  if(returnData){return(percentVar)}
+  percentVar %>%
+    dplyr::slice(1:n_pca) %>%
+    ggplot(aes(x=PC, y=variance)) +
+    geom_bar(stat="identity") +
+    ggtitle("Scree plot") +
+    ylab("Percent total variance") +
+    theme_bw()
+  
+}
+```
+
+```{r}
+#For extracting percent variance associated with a PC
+get_var <- function(PC, x){
+  p = x[x$PC == PC, ]$variance
+  paste0(round(p, 1), "%")
+}
+```
+
+```{r}
+#Plot PCAs with ggplots2, color mandatory, shape optional
+gg_pca <- function(pca.df, x.pc, y.pc, pVar,
+                   color.var, shape.var=NULL){
+  
+  ncolors <- length(unique(pca.df[,color.var]))
+  
+  if(is.null(shape.var)){
+    ggplot(pca.df, aes(x=get(x.pc), y=get(y.pc),
+                       color=get(color.var))) +
+      geom_point()  + 
+      xlab(paste0(x.pc, ": ", get_var(x.pc,x = pVar))) +
+      ylab(paste(y.pc, ": ", get_var(y.pc,x = pVar))) +
+      labs(color = color.var)
+  } else {
+    ggplot(pca.df, aes(x=get(x.pc), y=get(y.pc),
+                       color=get(color.var),
+                       shape=get(shape.var))) +
+      geom_point()  +
+      xlab(paste0(x.pc, ": ", get_var(PC = x.pc, x = pVar))) +
+      ylab(paste(y.pc, ": ", get_var(y.pc,x = pVar))) +
+      labs(color = color.var, shape = shape.var)
+  }
+}
+```
+
+```{r}
+#Wrapper function to go from a count matrix straight to a ggplot of PCA data
+mat_to_ggpca <- function(mat, cvar = "group", svar = NULL,
+                         features = NULL, # an optional vector of features
+                         sampledata,
+                         pc.x = "PC1", pc.y = "PC2", returnData = F){
+  
+  #Select relevant features
+  if(!is.null(features)){
+    stopifnot(all(features %in% rownames(mat)))
+    mat <- mat[rownames(mat) %in% features,] 
+    stopifnot(nrow(mat) == nrow(features))
+  }
+  
+  #Calculate PCs
+  thisnc.pca <- prcomp(t(mat))
+  thispercVar <- scree_plot(res_prcomp = thisnc.pca, n_pca=20, returnData = T)
+  
+  #Sometimes less than 100 PCs are returned
+  pcmax <- ifelse(ncol(thisnc.pca$x) < 100, ncol(thisnc.pca$x), 100)
+  
+  #Reshape data
+  thispca.df <- as.data.frame(thisnc.pca$x[, 1:pcmax]) %>%
+    rownames_to_column("sample")
+  thispca.df <- right_join(sampledata,thispca.df, by='sample')
+  
+  if(returnData){return(thispca.df)}
+  
+  #Create plot
+  gg_pca(pca.df = thispca.df, x.pc = pc.x, y.pc = pc.y, pVar = thispercVar,
+       color.var = cvar, shape.var = svar)
+}
+
+```
+
+### Scree plot
+
+```{r}
+scree_plot(prcomp(t(normAll)))
+```
+
+### All samples
+
+#### Case-control status
+
+```{r}
+mat_to_ggpca(normAll, cvar = "group", sampledata = dgeAll$samples)+
+  scale_color_calc() +
+  ggtitle("Case control status: all samples")
+```
+
+#### Elastic net features
+
+```{r}
+mat_to_ggpca(normAll, features = enet_feat$ensembl_gene_id,
+             sampledata = dgeAll$samples, cvar = "group") +
+  scale_color_calc() +
+  ggtitle(paste("PCA on", length(enet_feat$ensembl_gene_id),
+                "enet features, all samples"))
+```
+
+#### PSO features
+
+```{r}
+mat_to_ggpca(normAll, features = psosvm.feat$ensembl_gene_id,
+             sampledata = dgeAll$samples, cvar = "group") +
+  scale_color_calc() +
+  ggtitle(paste("PCA on", length(psosvm.feat$ensembl_gene_id),
+                "pso-svm features, all samples"))
+```
+
+#### Hospital
+
+```{r}
+mat_to_ggpca(normAll, cvar = "hosp", sampledata = dgeAll$samples)+
+  scale_color_aaas() +
+  ggtitle("Hospital of origin: all samples")
+
+```
+
+### Original dataset
+
+#### Case-control status
+
+```{r}
+mat_to_ggpca(normOriginal, cvar = "group", sampledata = dgeOriginal$samples)+
+  scale_color_calc() +
+  ggtitle("Case control status: original dataset")
+```
+
+#### Elastic net features
+
+```{r}
+mat_to_ggpca(normOriginal, features = enet_feat$ensembl_gene_id,
+             sampledata = dgeOriginal$samples, cvar = "group") +
+  scale_color_calc() +
+  ggtitle(paste("PCA on", length(enet_feat$ensembl_gene_id),
+                "enet features, original dataset"))
+```
+
+Subsequent PCs:
+
+```{r}
+mat_to_ggpca(normOriginal, features = enet_feat$ensembl_gene_id,
+             cvar = "group", sampledata = dgeOriginal$samples, pc.x = "PC3", pc.y = "PC4") +
+  scale_color_calc() +
+  ggtitle(paste("PCA on", nrow(enet_feat), "enet features, original dataset"))
+
+mat_to_ggpca(normOriginal, features = enet_feat$ensembl_gene_id,
+             cvar = "group", sampledata = dgeOriginal$samples, pc.x = "PC5", pc.y = "PC6") +
+  scale_color_calc() +
+  ggtitle(paste("PCA on", nrow(enet_feat), "enet features, original dataset"))
+
+mat_to_ggpca(normOriginal, features = enet_feat$ensembl_gene_id,
+             cvar = "group", sampledata = dgeOriginal$samples, pc.x = "PC7", pc.y = "PC8") +
+  scale_color_calc() +
+  ggtitle(paste("PCA on", nrow(enet_feat), "enet features, original dataset"))
+```
+
+PCs 6-8 look a little better than PCs 1&2, but not a lot. Can we do better?
+
+##### PCs associated with case-control status
+
+Testing the first 100 principal components for significance with cancer/noncancer.
+
+```{r}
+#Combine metadata with PCs
+pca.df <- mat_to_ggpca(normOriginal, features = enet_feat$ensembl_gene_id,
+                       sampledata = dgeOriginal$samples, cvar = "group", returnData = T)
+
+#Perform kruskal wallis test and extract p value
+pc_cancer <- lapply(paste0('PC', 1:100), function(x){
+  kruskal.test(pca.df[[x]], pca.df$group)$p.value
+}) %>%
+  #Reshape results
+  unlist() %>% enframe("PC", "nom.p") %>%
+  #Multiple testing correction
+  mutate(bonferroni=p.adjust(nom.p, "bonferroni"),
+         fdr = p.adjust(nom.p, "BH")) %>%
+  #Select significant PCs and order by fdr
+  filter(fdr < 0.05) %>% arrange(fdr) #%>%
+  #mutate(PCs = str_pad(as.character(PC), width = 2, side = "left", pad = "0"), .after= PC)
+
+pc_cancer %>%
+  arrange(PC)
+```
+
+Variance represented by all PCs significantly associated with case control status in original dataset. Note that this is not the same as variance explained by case control status.
+
+```{r}
+prcomp(t(normOriginal)) %>%
+  scree_plot(res_prcomp = ., n_pca=100, returnData = T) %>%
+  mutate(PC = as.integer(str_remove(as.character(PC), "PC"))) %>%
+  filter(PC %in% pc_cancer$PC) %>% pull(variance) %>%
+  sum()
+```
+
+Plot PCs associated with case-control status.
+
+```{r}
+mat_to_ggpca(normOriginal, features = enet_feat$ensembl_gene_id,
+             sampledata = dgeOriginal$samples,
+             cvar = "group", pc.x = "PC1", pc.y = "PC6") +
+  scale_color_calc() +
+  ggtitle(paste("Top PCs (1 & 6) significantly associated with case control status,
+                elastic net features, original dataset"))
+```
+
+```{r}
+mat_to_ggpca(normOriginal, features = enet_feat$ensembl_gene_id,
+             sampledata = dgeOriginal$samples,
+             cvar = "group", pc.x = "PC6", pc.y = "PC7") +
+  scale_color_calc() +
+  ggtitle(paste("PCs (6 & 7) significantly associated with case control status,
+                elastic net features, original dataset"))
+```
+
+#### PSO features
+
+```{r}
+mat_to_ggpca(normOriginal, features = psosvm.feat$ensembl_gene_id,
+             sampledata = dgeOriginal$samples, cvar = "group") +
+  scale_color_calc() +
+  ggtitle(paste("PCA on", length(psosvm.feat$ensembl_gene_id),
+                "pso-svm features, original dataset"))
+```
+
+#### Hospital
+
+```{r}
+mat_to_ggpca(normOriginal, cvar = "hosp", sampledata = dgeOriginal$samples)+
+  scale_color_aaas() +
+  ggtitle("Hospital of origin: original dataset")
+
+```
+
+### Blind validation dataset
+
+#### Case-control status
+
+```{r}
+mat_to_ggpca(normBlind, cvar = "group", sampledata = dgeBlindVal$samples)+
+  scale_color_calc() +
+  ggtitle("Case control status: blind validation")
+```
+
+#### Elastic net features
+
+```{r}
+mat_to_ggpca(normBlind, features = enet_feat$ensembl_gene_id,
+             sampledata = dgeBlindVal$samples, cvar = "group") +
+  scale_color_calc() +
+  ggtitle(paste("PCA on", length(enet_feat$ensembl_gene_id),
+                "enet features, blind validation dataset"))
+```
+
+#### PSO features
+
+```{r}
+mat_to_ggpca(normBlind, features = psosvm.feat$ensembl_gene_id,
+             sampledata = dgeBlindVal$samples, cvar = "group") +
+  scale_color_calc() +
+  ggtitle(paste("PCA on", length(psosvm.feat$ensembl_gene_id),
+                "pso features, blind validation dataset"))
+```
+
+#### Ery contamination
+
+We only have this metric available for some of the blind validation samples, scored by VUMC techs.
+
+```{r}
+mat_to_ggpca(normBlind,
+             sampledata = dgeBlindVal$samples,
+             cvar = "ery_contam") +
+  scale_color_calc() +
+  ggtitle(paste("PCA on blind validation dataset: ery contamination"))
+```
+
+#### Pellet quality
+
+As with ery contam, we only have this metric available for some of the blind validation samples, scored by VUMC techs.
+
+```{r}
+mat_to_ggpca(normBlind,
+             sampledata = dgeBlindVal$samples,
+             cvar = "pellet_qual") +
+  scale_color_calc() +
+  ggtitle(paste("PCA on blind validation dataset: pellet quality"))
+```
+
+## t-SNE
+
+### Case control status
+
+On original dataset:
+
+```{r}
+#set.seed(123)
+
+gg_tsne <- function(mat, sampledata, col = "group", seed = 123, returndata = F){
+  
+  #A seed must be set for reproducible results
+  set.seed(seed)
+ 
+  #Input should be row observations x column variables
+  tsne <- Rtsne::Rtsne(t(mat))
+  
+  tsne_df <- data.frame(tsne_x = tsne$Y[,1], tsne_y = tsne$Y[,2])
+    
+  tsne_df <- bind_cols(tsne_df, sampledata)
+  
+  if(returndata){return(tsne_df)}
+  
+  tsne_df %>%
+    ggplot(aes(x = tsne_x, y = tsne_y, color = get(col))) +
+    geom_point() +
+    labs(color = col)
+}
+
+gg_tsne(mat=normOriginal,
+        sampledata = dgeOriginal$samples) +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on original dataset, case-control status")
+
+```
+
+Facet by hospital:
+
+```{r}
+gg_tsne(mat=normOriginal,
+        sampledata = dgeOriginal$samples) +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on original dataset, case-control status") +
+  facet_wrap(~hosp)
+```
+
+### Hospital of origin
+
+```{r}
+gg_tsne(mat=normOriginal,
+        sampledata = dgeOriginal$samples,
+        col = "hosp") +
+  ggsci::scale_color_aaas() +
+  ggtitle("t-SNE on original dataset, isolation location")
+```
+
+### EN features only
+
+Subset counts to genes present within elastic net.
+
+```{r}
+normEN <- normOriginal[rownames(normOriginal) %in% enet_feat$ensembl_gene_id, ]
+stopifnot(nrow(normEN) == nrow(enet_feat))
+```
+
+```{r}
+gg_tsne(mat=normEN,
+        sampledata = dgeOriginal$samples) +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on original dataset, elastic net features")
+```
+
+```{r}
+gg_tsne(mat=normEN,
+        sampledata = dgeOriginal$samples) +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on original dataset, elastic net features") +
+  facet_wrap(~hosp)
+```
+
+```{r}
+gg_tsne(mat=normEN, col = "hosp",
+        sampledata = dgeOriginal$samples) +
+  ggsci::scale_color_aaas() +
+  ggtitle("t-SNE on original dataset, elastic net features")
+```
+
+## UMAP
+
+See [vignette](https://cran.r-project.org/web/packages/umap/vignettes/umap.html) for details.
+
+### Case-control status
+
+```{r}
+gg_umap <- function(mat, sampledata, col = "group", seed = 123, returndata = F){
+  
+  #Set seed for reproducibility
+  set.seed(seed)
+  
+  #input should be observations x variables
+  mapres <- umap(t(mat))
+  
+  #Create data frame from umap results and add sample data
+  umap_df <- data.frame(umap_x = mapres$layout[,1], umap_y = mapres$layout[,2])
+  umap_df <- bind_cols(umap_df, sampledata)
+  
+  if(returndata){return(umap_df)}
+  
+  #Plot
+  umap_df %>%
+    ggplot(aes(x = umap_x, y = umap_y, color = get(col))) +
+    geom_point() +
+    labs(color = col)
+  
+}
+
+gg_umap(mat=normOriginal,
+        sampledata = dgeOriginal$samples,
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("UMAP on original dataset, case-control status")
+```
+
+Faceted by hospital.
+
+```{r}
+gg_umap(mat=normOriginal,
+        sampledata = dgeOriginal$samples,
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("UMAP on original dataset, case-control status") +
+  facet_wrap(~hosp)
+```
+
+### Hospital of origin
+
+```{r}
+gg_umap(mat=normOriginal,
+        sampledata = dgeOriginal$samples,
+        col = "hosp") +
+  ggsci::scale_color_aaas() +
+  ggtitle("UMAP on original dataset, isolation location")
+```
+
+```{r}
+sessionInfo()
+```

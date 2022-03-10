@@ -1,0 +1,1067 @@
+---
+title: "Inter-hospital classifiers"
+author: "Kat Moore"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    df_print: paged
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+library(edgeR)
+library(DESeq2)
+library(here)
+library(caret)
+library(ComplexHeatmap)
+library(Rtsne)
+library(umap)
+library(pROC)
+library(tidyverse)
+library(ggthemes)
+library(ggpmisc)
+
+theme_set(theme_bw())
+```
+
+In this notebook, we re-examine classifiers that are trained on one hospital and predict on another. We also revisit the performance of classifiers that predict hospital of origin.
+
+Kappa is essentially another metric for balanced accuracy, designed to handle class imbalances. Optimizing on kappa has the advantage of not throwing away any data but is less often used than ROC. Downsampling allows us to handle the class imbalance while keeping the popular ROC metric, and using it makes the elastic net a bit more similar to the particle swarm. However, it does throw away most of the data.
+
+## Load data
+
+### Expression & metadata 
+
+For both original dataset and blind validation:
+
+```{r}
+dgeAll <- readRDS(file = here("Rds/07b_dgeAll.Rds"))
+```
+
+After the metadata update, there are no longer any MGH controls. Now the NKI (original and independent/blinded) is the only hospital that contributes both cases and controls.
+
+```{r}
+table(dgeAll$samples$hosp, dgeAll$samples$group)
+```
+
+Create subsets for original data and blind val:
+
+```{r}
+dgeOriginal <- dgeAll[,dgeAll$samples$Dataset == "Original"]
+dgeOriginal$samples <- droplevels(dgeOriginal$samples)
+
+dgeBlindVal <- dgeAll[,dgeAll$samples$Dataset == "blindVal"]
+dgeBlindVal$samples <- droplevels(dgeBlindVal$samples)
+```
+
+### Normalization-related functions
+
+```{r}
+source(here("bin/tmm_training_norm.R"))
+```
+
+### Elastic net classifier & features
+
+```{r}
+model_altlambda <- readRDS(here("Rds/04_model_altlambda.Rds"))
+
+feature_extraction <- function(fit, dict = dgeAll$genes){
+   coef(fit$finalModel, fit$bestTune$lambda) %>%
+    as.matrix() %>% as.data.frame() %>%
+    slice(-1) %>% #Remove intercept
+    rownames_to_column("feature") %>%
+    rename(coef = "1") %>%
+    filter(coef !=0) %>%
+    left_join(., dict, by = c("feature" = "ensembl_gene_id")) %>%
+    rename("ensembl_gene_id"=feature) %>%
+    arrange(desc(abs(coef)))
+}
+
+enet_feat <- feature_extraction(model_altlambda$fit)
+
+head(enet_feat)
+```
+
+## Data partitions
+
+The NKI is the only location that contributed both cases and controls. When testing to what degree the batch effect is contributing to classifier performance, this is the only hospital we can use to train a single-center classifier.
+
+```{r}
+dgeAll$samples %>%
+  select(hosp, group) %>%
+  droplevels() %>%
+  table()
+```
+
+Before the metadata update, MGH contributed both cases and controls. Now it only contributes cases. It no longer makes much sense to predict on only MGH samples.
+
+```{r}
+dgeAll$samples %>%
+  filter(hosp == "MGH") %>%
+  select(group, hosp) %>%
+  droplevels() %>%
+  table()
+```
+
+The VUMC contributed overwhelmingly controls and just a few cases.
+
+```{r}
+dgeAll$samples %>%
+  filter(hosp == "VUMC") %>%
+  select(group, hosp) %>%
+  droplevels() %>%
+  table()
+```
+
+We will therefore use a combination of MGH samples and VUMC samples as controls, and NKI samples for training.
+
+```{r}
+normalize_dge <- function(dge = dgeAll, hosp.train = "NKI", hosp.val,
+                                verbose=T, return.dge = F){
+  
+  #Subset dge to relevant hospitals
+  dge <- dge[,dge$samples$hosp %in% c(hosp.train, hosp.val)]
+  dge$samples <- droplevels(dge$samples)  
+  
+  #Set the correct samples to be training/validation
+  dge$samples$Label <- ifelse(
+    dge$samples$hosp == hosp.train, "Training", "Validation"
+  )
+  
+  #Data partitions
+  if(verbose){
+    print(table(dge$samples$hosp, dge$samples$Label))
+    print(table(dge$samples$Label, dge$samples$group))
+  }
+  
+  #sanity check
+  stopifnot(all(unique(dge$samples$hosp) %in% c(hosp.train, hosp.val)))
+  stopifnot(identical(dge$samples$hosp == hosp.train,
+                      dge$samples$Label == "Training"))
+  stopifnot(identical(dge$samples$hosp %in% hosp.val,
+                      dge$samples$Label == "Validation"))
+  
+  #Get reference sample
+  dge$TMMref <- getTMMref(
+    dge,
+    samples.for.training = colnames(dge)[dge$samples$Label == "Training"]
+    )
+  
+  #Can return the dgeList here as input for elastic net training functoin
+  if(return.dge){return(dge)}
+  
+  #Otherwise, TMM and log normalize count matrix
+  normCounts <- edgeR::cpm(calcNormFactorsTraining(
+    object = dge, method = "TMM",
+    refColumn = dge$TMMref$col.index,
+    samples.for.training = colnames(dge)[dge$samples$Label == "Training"]),
+    log = T, normalized.lib.sizes = T)
+  
+  #Return only those counts within the validation set
+  valCounts <- normCounts[,colnames(dge)[dge$samples$Label == "Validation"]]
+  
+}
+
+dgeInter <- normalize_dge(dge = dgeAll, hosp.train = "NKI", hosp.val = c("MGH", "VUMC"),
+                          verbose=T, return.dge = T)
+```
+
+## Training/val samples
+
+Only original NKI samples will be used for calculating TMM normalization factors, so there will be no leakage of data betwen partitions.
+
+```{r}
+training_samples = colnames(dgeInter)[dgeInter$samples$Label == "Training"]
+validation_samples = colnames(dgeInter)[dgeInter$samples$Label == "Validation"]
+
+stopifnot(all(sort(colnames(dgeInter)) == sort(c(training_samples, validation_samples))))
+
+#Show reference sample, should be from NKI
+#Dataset should be "Original"
+bind_cols(dgeInter$TMMref,
+          dgeInter$samples[rownames(dgeInter$samples) == dgeInter$TMMref$ref.sample,])
+```
+
+## Kappa: NKI-only classifier
+
+If we use all NKI samples for training, there is a class imbalance.
+
+```{r}
+dgeAll$samples %>%
+  filter(hosp == "NKI") %>%
+  select(group, hosp) %>%
+  droplevels() %>%
+  table()
+```
+
+We should not optimize on AUC but rather a metric that will compensate for the class imbalance.Kappa is a performance metric that better handles class imbalances.
+Kappa = (observed accuracy - expected accuracy)/(1 - expected accuracy)
+
+### Train model using kappa
+
+Kappa optimization is less analogous to the PSO-SVM, but it has the advantage of using all the available data, unlike downsampling.
+
+```{r}
+enet_train <- function(
+  dge,
+  train_samples, #A vector matching the column names of training samples
+  val_samples, #A vector matching the column names of training samples
+  grid = expand.grid(
+    alpha = seq(0,1, by=0.1),
+    lambda = 10^seq(-4, 2, length = 100)
+    ) ,
+  sumFunc, #Use twoClassSummary for ROC or defaultSummary for kappa
+  met, #Must be a metric returned by sumFunc, ex. "ROC" or "Kappa"
+  samp = NULL, #Sampling param, should be NULL, "up", "down","rose" or "smote"
+  verboseIter = F, #Whether to print progress by fold
+  refCol = dge$TMMref$col.index, #The column index of the TMM reference sample
+  time_elapsed = T
+){
+  
+  if(sum(train_samples %in% val_samples > 0)){
+    stop("There should be no overlap between training and eval")
+  }
+  
+  if(is.null(dge$TMMref)){stop("Run getTMMref on dge first")}
+  
+  start <- Sys.time()
+  
+  #Ensure that sample names don't get shuffled
+  dge$samples$sample_name <- colnames(dge)
+  stopifnot(all(dge$samples$sample_name == colnames(dge)))
+  
+  #Normalize  counts
+  counts <- edgeR::cpm(calcNormFactorsTraining(
+    object = dge, method = "TMM",
+    refColumn = dge$TMMref$col.index,
+    samples.for.training = training_samples),
+    log = T, normalized.lib.sizes = T)
+  #return(counts)
+  
+  #Subset counts
+  train <- counts[, train_samples]
+  val <- counts[, val_samples]
+  
+  #Retrieve true classes
+  #For training set
+  train_true <- dge$samples %>%
+    filter(sample_name %in% colnames(train)) %>%
+    select(sample_name, group)
+  
+  #For validation set
+  val_true <- dge$samples %>%
+    filter(sample_name %in% colnames(val)) %>%
+    select(sample_name, group)
+  
+  #Ensure that column/sample names don't get shuffled
+  train_true <- train_true[order(match(train_true$sample_name,colnames(train))),]
+  stopifnot(all(train_true$sample_name == colnames(train)))
+  
+  val_true <- val_true[order(match(val_true$sample_name, colnames(val))),]
+  stopifnot(all(val_true$sample_name == colnames(val)))
+  
+  #Train model
+  model <- caret::train(
+    x = t(train),
+    y = train_true$group,
+    method = "glmnet",
+    metric = met,
+    tuneGrid = grid,
+    trControl = trainControl(
+      method = "cv", number = 10,
+      verboseIter = verboseIter,
+      classProbs=TRUE,
+      summaryFunction = sumFunc,
+      #Add sampling parameter
+      sampling = samp
+    ),
+  )
+  
+  end <- Sys.time()
+  
+  if(time_elapsed){print(end-start)}
+  
+  list(fit = model,
+       train = list(data = t(train),
+                    labels = train_true),
+       test = list(data = t(val),
+                   labels = val_true)
+       )
+}
+
+set.seed(123)
+#Only rerun if the results don't already exist, since it takes ~5 minutes to complete
+overwrite <- F
+outFile <- here("Rds", "10_interhosp_kappa.Rds")
+
+if(!file.exists(outFile) | overwrite == T){
+  model.kappa <- enet_train(
+    dge = dgeInter,
+    train_samples = training_samples, 
+    val_samples = validation_samples,
+    sumFunc = defaultSummary,
+    met = "Kappa",
+    samp = NULL,
+    verboseIter = F, 
+    refCol = dgeInter$TMMref$col.index, 
+    time_elapsed = T
+    )
+  saveRDS(object = model.kappa, file = outFile)
+} else {
+  model.kappa <- readRDS(outFile)
+}
+
+model.kappa$fit$bestTune
+```
+
+### Model fit plot
+
+```{r}
+ggfitplot <- function(fit, id=""){
+  
+  metric <- fit$metric
+  
+  bestPerf = fit$results %>%
+    filter(alpha == fit$bestTune$alpha,
+           lambda == fit$bestTune$lambda) %>%
+    pull(!!metric)
+  
+  #return(bestPerf)
+  
+  ggplot(fit)$data %>%
+    ggplot(aes(x = lambda, y = get(metric), color = alpha)) +
+    geom_line() +
+    scale_x_log10() +
+    ggtitle(paste0(id, " Best alpha: ", fit$bestTune$alpha,
+                   ", best lambda: ", signif(fit$bestTune$lambda, 4))) +
+    geom_point(aes(x=fit$bestTune$lambda, y=bestPerf), colour="red", shape=8) +
+    ylab(metric)
+}
+
+ggfitplot(model.kappa$fit)
+```
+
+### Performance metrics
+
+Performance of the NKI-only classifier on other hospitals is quite poor.
+
+```{r}
+enet_pred <- function(fit, val_data, mod = "elastic net"){
+  
+  class = cbind(
+    sample = colnames(val_data),
+    predicted.group = as.character(predict(fit, newdata = t(val_data), type="raw"))
+  )
+  #return(class)
+  probs = predict(fit, newdata = t(val_data), type="prob")
+  colnames(probs) <- paste0("prob.",colnames(probs))
+  probs$model <- mod
+  #return(probs)
+  df <- cbind(class, probs)
+  df$predicted.group <- factor(df$predicted.group, levels = c(
+    "healthyControl", "breastCancer"))
+  df
+  
+}
+
+report_performance <- function(df, dig = 4, xtable = F, mod = unique(df$model)){
+  
+  #Calculate via pROC package
+  result.roc <- pROC::roc(
+    #a factor, numeric or character vector of true labels, typically encoded with 0 (controls) and 1 (cases)
+    response = df$real.group, levels = c("healthyControl", "breastCancer"),
+    #the probability that a sample belongs to cases, typically from predict()
+    predictor = df$prob.breastCancer,
+    ci = T,
+    #Prints a helpful explicit message when it happens automatically
+    #levels = c("healthyControl", "breastCancer") #Should match the factor, where ref is first
+  )
+  #return(result.roc)
+  
+  #Ensure we standardize the levels
+  confMat <- caret::confusionMatrix(
+    data = factor(df$predicted.group, levels = c("healthyControl", "breastCancer")),
+    reference = factor(df$real.group, levels = c("healthyControl", "breastCancer")),
+    positive = "breastCancer",
+    mode="everything"
+  )
+  
+  if(xtable){return(confMat)}
+  
+  tibble(
+    model = mod,
+    AUC = round(result.roc$auc, dig),
+    CI.95 = paste(round(result.roc$ci[1], dig+1),
+                  round(result.roc$ci[3], dig+1),
+                  sep = "-"),
+    Accuracy = round(confMat$overall[names(confMat$overall)=="Accuracy"], dig),
+    Sensitivity = round(confMat$byClass[names(confMat$byClass)=="Sensitivity"], dig),
+    Specificity = round(confMat$byClass[names(confMat$byClass)=="Specificity"], dig),
+    PPV = round(confMat$byClass[names(confMat$byClass)=="Pos Pred Value"], dig),
+    NPV = round(confMat$byClass[names(confMat$byClass)=="Neg Pred Value"], dig),
+    F1 =  round(confMat$byClass[names(confMat$byClass)=="F1"], dig),
+    Kappa =  round(confMat$overall[names(confMat$overall)=="Kappa"], dig)
+  )
+}
+
+perf_kappa <- enet_pred(fit = model.kappa$fit,
+          val_data = t(model.kappa$test$data),
+          mod = "NKI-only kappa on VUMC&MGH") %>%
+  left_join(., dgeInter$samples,
+           by = "sample") %>%
+  rename(real.group = group)
+
+perf_kappa %>%
+  report_performance(.)
+```
+
+### Dotplot
+
+The kappa-optimized version of the NKI classifier incorrectly predicts almost every control as cancer with high confidence.
+
+```{r}
+perf_kappa %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer, fill = hosp)) +
+  geom_jitter(height = 0, width = 0.2, shape = 21) +
+  scale_fill_few() +
+  ylim(0, 1) +
+  ggtitle("NKI-only kappa-optimtized classifier performance on MGH & VUMC")
+```
+
+Zoomed-in version with boxplot:
+
+```{r}
+perf_kappa %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer)) +
+  geom_jitter(aes(fill = hosp), height = 0, width = 0.2, shape = 21) +
+  geom_boxplot(alpha = 0) +
+  scale_fill_few() + 
+  ggtitle("NKI-only kappa-optimized classifier performance on MGH & VUMC")
+```
+
+### Cross-table
+
+There's no universal interpretation for kappa. "Fleiss considers kappas > 0.75 as excellent, 0.40-0.75 as fair to good, and < 0.40 as poor." See [this primer](https://stats.stackexchange.com/questions/82162/cohens-kappa-in-plain-english) for more information on kappa.
+
+```{r}
+report_performance(perf_kappa, xtable = T)
+```
+
+### ROC graph
+
+```{r}
+plotmyroc <- function(df, title){
+  
+  roc.res <- pROC::roc(
+    response = df$real.group,
+    predictor = df$prob.breastCancer,
+    ci = T,
+    #Prints a helpful explicit message when it happens automatically
+    #levels = c("healthyControl", "breastCancer") #Should match the factor, where ref is first
+  )
+  
+  rocobj <- pROC::plot.roc(roc.res,
+                           main = title, 
+                           percent=TRUE,
+                           #ci = TRUE,  #Finite xlim glitch         
+                           print.auc = TRUE,
+                           print.thres = "best",
+                           asp = NA)
+  
+  ciobj <- ci.se(rocobj,                         # CI of sensitivity
+                 specificities = seq(0, 1, 0.05)) # over a select set of specificities
+  plot(ciobj, type = "shape", col = "#1c61b6AA")     # plot as a blue shape
+  plot(ci(rocobj, of = "thresholds", thresholds = "best")) # add one threshold
+}
+
+plotmyroc(perf_kappa, title = "NKI-only kappa-optimized classifier performance on MGH & VUMC")
+```
+
+### Optimal threshold
+
+Calculate the optimal probability threshold for separating cases and controls.
+
+```{r}
+opt_threshold <- function(df){
+  roc.res <- pROC::roc(
+    response = df$real.group,
+    predictor = df$prob.breastCancer,
+    ci = T,
+    #Prints a helpful explicit message when it happens automatically
+    #levels = c("healthyControl", "breastCancer") #Should match the factor, where ref is first
+  )
+  coords(roc.res, "best", "threshold", transpose = F)
+}
+
+opt_threshold(perf_kappa)
+```
+
+That threshold is so high as to be unusuable in a clinical setting. Still, we can recalculate the cross-table using the optimal threshold to see how it would look.
+
+```{r}
+threshold_performance <- function(df, thresh = opt_threshold(df)$threshold, xtable = T){
+  
+  df <- df %>%
+    mutate(opt_thresh = thresh, .after=predicted.group) %>%
+    mutate(predicted.group = ifelse(prob.breastCancer > thresh, "breastCancer", "healthyControl"))
+   #return(df)
+  
+  tbl <- caret::confusionMatrix(
+    data = factor(df$predicted.group, levels = c("healthyControl", "breastCancer")),
+    reference = factor(df$real.group, levels = c("healthyControl", "breastCancer")),
+    positive = "breastCancer",
+    mode="everything"
+  )
+  
+  if(xtable){return(tbl)}
+  
+  list(df, tbl)
+}
+
+threshold_performance(perf_kappa)
+```
+
+That threshold is derived from the performance of two hospitals together. Since we are trying to compensate for the batch effect, we are more interested whether a threshold derived from a single center is transferrable to another center.
+
+Because MGH has breast cancer only and no controls, we can only do this in one direction: VUMC to MGH.
+
+```{r}
+#Extract hospital-specific counts for validation
+normMGH <- normalize_dge(dge = dgeAll, hosp.train = "NKI", hosp.val = "MGH",
+                             verbose=F, return.dge = F)
+normVUMC <- normalize_dge(dge = dgeAll, hosp.train = "NKI", hosp.val = "VUMC",
+                             verbose=F, return.dge = F)
+
+#Predict on that hospital specifically 
+perf_kappa_MGH <- enet_pred(fit = model.kappa$fit,
+          val_data = normMGH,
+          mod = "NKI-only kappa on MGH") %>%
+  left_join(., dgeAll$samples,
+           by = "sample") %>%
+  rename(real.group = group)
+
+perf_kappa_VUMC <- enet_pred(fit = model.kappa$fit,
+          val_data = normVUMC,
+          mod = "NKI-only kappa on VUMC") %>%
+  left_join(., dgeAll$samples,
+           by = "sample") %>%
+  rename(real.group = group)
+
+#Apply VUMC threshold to MGH
+threshold_performance(perf_kappa_MGH, thresh = opt_threshold(perf_kappa_VUMC)$threshold)
+```
+
+Not very informative, since the problem was predicting controls correctly, not predicting cases directly. Moving on.
+
+## ROC downsampling: NKI-only classifier
+
+Let's be 100% sure that we aren't getting a classifier that predicts only breast cancer due to class imbalances. Retrain the NKI-only model using downsampling inside the cross validation loop. 
+
+We've already set up the data partition above, and can reuse it here.
+
+### Train model using ROC and downsampling
+
+Caret has a feature that allows downsampling inside of a cross-validation loop. This requires editing the training function by adding an extra option within `trainControl`. See [caret documentation, chapter 11](https://topepo.github.io/caret/subsampling-for-class-imbalances.html).
+
+See also [chapter 17](https://topepo.github.io/caret/measuring-performance.html) for available summary functions.
+
+```{r}
+enet_train <- function(
+  dge,
+  train_samples, #A vector matching the column names of training samples
+  val_samples, #A vector matching the column names of training samples
+  grid = expand.grid(
+    alpha = seq(0,1, by=0.1),
+    lambda = 10^seq(-4, 2, length = 100)
+    ) ,
+  sumFunc, #Use twoClassSummary for ROC or defaultSummary for kappa
+  met, #Must be a metric returned by sumFunc, ex. "ROC" or "Kappa"
+  samp = NULL, #Sampling param, should be NULL, "up", "down","rose" or "smote"
+  verboseIter = F, #Whether to print progress by fold
+  refCol = dge$TMMref$col.index, #The column index of the TMM reference sample
+  time_elapsed = T
+){
+  
+  if(sum(train_samples %in% val_samples > 0)){
+    stop("There should be no overlap between training and eval")
+  }
+  
+  if(is.null(dge$TMMref)){stop("Run getTMMref on dge first")}
+  
+  start <- Sys.time()
+  
+  #Ensure that sample names don't get shuffled
+  dge$samples$sample_name <- colnames(dge)
+  stopifnot(all(dge$samples$sample_name == colnames(dge)))
+  
+  #Normalize  counts
+  counts <- edgeR::cpm(calcNormFactorsTraining(
+    object = dge, method = "TMM",
+    refColumn = dge$TMMref$col.index,
+    samples.for.training = training_samples),
+    log = T, normalized.lib.sizes = T)
+  #return(counts)
+  
+  #Subset counts
+  train <- counts[, train_samples]
+  val <- counts[, val_samples]
+  
+  #Retrieve true classes
+  #For training set
+  train_true <- dge$samples %>%
+    filter(sample_name %in% colnames(train)) %>%
+    select(sample_name, group)
+  
+  #For validation set
+  val_true <- dge$samples %>%
+    filter(sample_name %in% colnames(val)) %>%
+    select(sample_name, group)
+  
+  #Ensure that column/sample names don't get shuffled (again)
+  train_true <- train_true[order(match(train_true$sample_name,colnames(train))),]
+  stopifnot(all(train_true$sample_name == colnames(train)))
+  
+  val_true <- val_true[order(match(val_true$sample_name, colnames(val))),]
+  stopifnot(all(val_true$sample_name == colnames(val)))
+  
+  #Train model
+  model <- caret::train(
+    x = t(train),
+    y = train_true$group,
+    method = "glmnet",
+    metric = met,
+    tuneGrid = grid,
+    trControl = trainControl(
+      method = "cv", number = 10,
+      verboseIter = verboseIter,
+      classProbs=TRUE,
+      summaryFunction = sumFunc,
+      #Add sampling parameter
+      sampling = samp
+    ),
+  )
+  
+  end <- Sys.time()
+  
+  if(time_elapsed){print(end-start)}
+  
+  list(fit = model,
+       train = list(data = t(train),
+                    labels = train_true),
+       test = list(data = t(val),
+                   labels = val_true)
+       )
+}
+
+set.seed(123)
+#Only rerun if the results don't already exist
+overwrite <- F
+outFile <- here("Rds", "10_interhosp_ds.Rds")
+
+if(!file.exists(outFile) | overwrite == T){
+  model.ds <- enet_train(
+    dge = dgeInter,
+    train_samples = training_samples, 
+    val_samples = validation_samples,
+    sumFunc = twoClassSummary,
+    met = "ROC",
+    samp = "down",
+    verboseIter = F, 
+    refCol = dgeInter$TMMref$col.index, 
+    time_elapsed = T
+    )
+  saveRDS(object = model.ds, file = outFile)
+} else {
+  model.ds <- readRDS(outFile)
+}
+
+model.ds$fit$bestTune
+```
+
+### Model fit plot
+
+```{r}
+ggfitplot(model.ds$fit)
+```
+
+### Performance metrics
+
+Performance is similar to the kappa-optimized model: 1 sensitivity, near-0 specificity/kappa.
+
+```{r}
+perf_ds <- enet_pred(fit = model.ds$fit,
+          val_data = t(model.ds$test$data),
+          mod = "NKI-only dsROC on VUMC&MGH") %>%
+  left_join(., dgeAll$samples,
+           by = "sample") %>%
+  rename(real.group = group)
+
+bind_rows(report_performance(perf_kappa),
+          report_performance(perf_ds))
+```
+
+### Dotplot
+
+The downsampled version still predicts almost exclusively breast cancer, but with much less certainty than kappa optimization.
+
+```{r}
+#Without box plot
+perf_ds %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer, fill = hosp)) +
+  geom_jitter(shape = 21, height = 0, width = 0.2) +
+  scale_fill_few() +
+  ylim(0, 1) +
+  ggtitle("NKI-only ROC-optimtized classifier with downsampling
+          performance on MGH & VUMC")
+
+#With box plot
+perf_ds %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer)) +
+  geom_jitter(aes(fill = hosp), shape = 21, height = 0, width = 0.2) +
+  scale_fill_few() +
+  ylim(0, 1) +
+  geom_boxplot(alpha = 0) +
+  ggtitle("NKI-only ROC-optimtized classifier with downsampling
+          performance on MGH & VUMC")
+```
+
+Zoomed-in version:
+
+```{r}
+#Without box plot
+perf_ds %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer, fill = hosp)) +
+  geom_jitter(shape = 21, height = 0, width = 0.2) +
+  scale_fill_few() +
+  ggtitle("NKI-only ROC-optimtized classifier with downsampling
+          performance on MGH & VUMC")
+
+#With box plot
+perf_ds %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer)) +
+  geom_jitter(aes(fill = hosp), shape = 21, height = 0, width = 0.2) +
+  scale_fill_few() +
+  geom_boxplot(alpha = 0) +
+  ggtitle("NKI-only ROC-optimtized classifier with downsampling
+          performance on MGH & VUMC")
+```
+
+### Cross-table
+
+```{r}
+perf_ds %>%
+  report_performance(xtable = T)
+```
+
+### ROC graph
+
+```{r}
+plotmyroc(perf_ds, title = "NKI-only ROC-optimtized classifier with downsampling
+          performance on MGH & VUMC")
+```
+
+### Optimal threshold
+
+Calculate the optimal probability threshold for separating cases and controls.
+
+```{r}
+opt_threshold(perf_ds)
+```
+
+We can recalculate the cross-table using the optimal threshold.
+
+```{r}
+threshold_performance(perf_ds)
+```
+
+That threshold is derived from the performance of two hospitals together. Since we are trying to compensate for the batch effect, we are more interested whether a threshold derived from a single center is transferrable to another center.
+
+Because MGH has breast cancer only and no controls, we can only do this in one direction: VUMC to MGH.
+
+```{r}
+#Predict on that hospital specifically 
+perf_ds_MGH <- enet_pred(fit = model.ds$fit,
+          val_data = normMGH,
+          mod = "NKI-only dsAUC on MGH") %>%
+  left_join(., dgeAll$samples,
+           by = "sample") %>%
+  rename(real.group = group)
+
+perf_ds_VUMC <- enet_pred(fit = model.ds$fit,
+          val_data = normVUMC,
+          mod = "NKI-only dsAUC on VUMC") %>%
+  left_join(., dgeAll$samples,
+           by = "sample") %>%
+  rename(real.group = group)
+
+#Apply VUMC threshold to MGH
+threshold_performance(perf_ds_MGH, thresh = opt_threshold(perf_ds_VUMC)$threshold)
+```
+
+Again, this is not informative, because the problem is predicting controls correctly, not predicting cases directly. We will see whether an optimized threshold is transferrable between centers when looking at the blind validation set.
+
+## NKI-only: blindval
+
+A classifier trained a single center should really do well on subsequent batches from the same center. Test the NKI-only classifier on the blind validation set. Use the downsampled version, since that one did a bit better on the other hospitals.
+
+```{r}
+blindcounts <- normalize_dge(dge = dgeAll, hosp.train = "NKI", hosp.val = "blindNKI",
+                             verbose=T, return.dge = F)
+```
+
+```{r}
+stopifnot(all(sort(colnames(blindcounts)) == sort(filter(dgeAll$samples, hosp == "blindNKI")$sample)))
+```
+
+### Performance metrics
+
+```{r}
+perf_ds_blind <- enet_pred(fit = model.ds$fit,
+          val_data = blindcounts, 
+          mod = "NKI-only dsROC on blindval") %>%
+  left_join(., dgeAll$samples,
+           by = "sample") %>%
+  rename(real.group = group)
+
+report_performance(perf_ds_blind)
+```
+
+### Dotplot
+
+```{r}
+perf_ds_blind  %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer, color = real.group)) +
+  geom_jitter(height = 0, width = 0.2) +
+  scale_color_calc() +
+  ylim(0, 1) +
+  ggtitle("NKI-only ROC-optimtized classifier with downsampling
+          performance on blind validation data")
+
+perf_ds_blind  %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer)) +
+  geom_jitter(aes(color = real.group), height = 0, width = 0.2) +
+  scale_color_calc() +
+  geom_boxplot(alpha = 0) +
+  ylim(0, 1) +
+  ggtitle("NKI-only ROC-optimtized classifier with downsampling
+          performance on blind validation data")
+```
+
+Zoomed-in version:
+
+```{r}
+perf_ds_blind  %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer, color = real.group)) +
+  geom_jitter(height = 0, width = 0.2) +
+  scale_color_calc() +
+  ggtitle("NKI-only ROC-optimtized classifier with downsampling
+          performance on blind validation data")
+
+perf_ds_blind  %>%
+  ggplot(aes(x = real.group, y = prob.breastCancer)) +
+  geom_jitter(aes(color = real.group), height = 0, width = 0.2) +
+  scale_color_calc() +
+  geom_boxplot(alpha = 0) +
+  ggtitle("NKI-only ROC-optimtized classifier with downsampling
+          performance on blind validation data")
+```
+
+### Cross-table
+
+```{r}
+perf_ds_blind %>%
+  report_performance(xtable = T)
+```
+
+### ROC plot
+
+```{r}
+plotmyroc(perf_ds_blind, title = "dsROC-optimized NKI classifier, predicting on blind val")
+```
+
+### Optimal threshold
+
+Calculate the optimal probability threshold for separating cases and controls.
+
+```{r}
+opt_threshold(perf_ds_blind)
+```
+
+We can recalculate the cross-table using the optimal threshold.
+
+```{r}
+threshold_performance(perf_ds_blind)
+```
+
+Compared to a threshold set at 0.5, these results are better. However, applying a threshold derived from the MGH & VUMC worsens performance.
+
+```{r}
+threshold_performance(perf_ds_blind, opt_threshold(perf_ds)$threshold)
+```
+
+From this, we can safely conclude that an optimal threshold cannot be applied between hospitals.
+
+## Original dataset cross-validation, revisited
+
+Contrast these results with the results of the enet trained on samples from all available hospitals.
+
+```{r}
+loocv <- read_csv(here("05_enet_LOOCV_predictions.csv"))
+```
+
+AUC performance on samples of all stages was 0.83:
+
+```{r}
+report_performance(rename(loocv, real.group = true.group))
+```
+
+### Cross-table
+
+Total number of mis-classified samples:
+
+```{r}
+loocv$misclassified %>% table()
+```
+
+Detailed stats:
+
+```{r}
+report_performance(rename(loocv, real.group = true.group), xtable = T)
+```
+
+### Dotplot
+
+```{r}
+loocv %>%
+  left_join(., select(dgeAll$samples, sample, hosp), by = "sample") %>%
+  ggplot(aes(x = true.group, y = prob.breastCancer)) +
+  geom_jitter(aes(fill = hosp), height = 0, width = 0.2, shape = 21) +
+  geom_boxplot(alpha = 0) +
+  #scale_fill_few() +
+  ylim(0, 1) +
+  ggtitle("Breast cancer probability of all samples within original dataset")
+```
+
+### Cross-table by hospital
+
+When provided with information from all centers, the classifier has the most difficulty predicting samples from the VUMC (except the "other" category, which is low n).
+
+```{r}
+loocv %>%
+  left_join(., select(dgeAll$samples, sample, hosp), by = "sample") %>%
+  group_by(hosp, misclassified) %>%
+  count() %>% pivot_wider(names_from = misclassified, names_prefix = "misclassified_",
+                          values_from = n, values_fill = 0) %>%
+  mutate(acc_by_hosp = misclassified_FALSE/sum(misclassified_FALSE + misclassified_TRUE))
+```
+
+Notably, it does a really good job of predicting MGH cancer (MGH only provided cancer) and a pretty bad job of predicting VUMC controls (which were the majority of what the VUMC provided). The NKI is somewhere in between.
+
+```{r}
+loocv %>%
+  left_join(., select(dgeAll$samples, sample, hosp), by = "sample") %>%
+  group_by(hosp, misclassified, true.group) %>%
+  count() %>% pivot_wider(names_from = misclassified, names_prefix = "misclassified_",
+                          values_from = n, values_fill = 0) %>%
+  mutate(acc_by_hosp = misclassified_FALSE/sum(misclassified_FALSE + misclassified_TRUE)) %>%
+  arrange(true.group, acc_by_hosp)
+```
+
+Graphical depiction of error by hospital:
+
+```{r}
+loocv %>%
+  left_join(., select(dgeAll$samples, sample, hosp), by = "sample") %>%
+  filter(hosp != "other") %>%
+  select(hosp, misclassified,true.group) %>%
+  ggplot(aes(x = hosp, fill = misclassified)) +
+  #geom_bar(position = "fill") +
+  geom_bar() +
+  facet_wrap(~true.group) +
+  scale_fill_colorblind() +
+  ggtitle("Classifier error by hospital")
+```
+
+### t-SNE cross table
+
+I thought perhaps the misclassified samples would cluster in dimensionality analyses, but that does not appear to be the case.
+
+```{r}
+gg_tsne <- function(mat, sampledata, col = "group", seed = 123, returndata = F){
+  
+  #A seed must be set for reproducible results
+  set.seed(seed)
+ 
+  #Input should be row observations x column variables
+  tsne <- Rtsne::Rtsne(t(mat))
+  
+  tsne_df <- data.frame(tsne_x = tsne$Y[,1], tsne_y = tsne$Y[,2])
+    
+  tsne_df <- bind_cols(tsne_df, sampledata)
+  
+  if(returndata){return(tsne_df)}
+  
+  tsne_df %>%
+    ggplot(aes(x = tsne_x, y = tsne_y, color = get(col))) +
+    geom_point() +
+    labs(color = col)
+}
+
+gg_tsne(mat=cpm(calcNormFactors(dgeOriginal), log=T),
+        sampledata = left_join(dgeOriginal$samples,
+                               select(loocv,sample, misclassified), by = "sample"),
+        col = "misclassified") +
+  ggthemes::scale_color_colorblind() +
+  ggtitle("t-SNE on original dataset, misclassified samples") +
+  facet_wrap(~hosp)
+```
+
+Actual case control status, for contrast:
+
+```{r}
+set.seed(123)
+
+gg_tsne(mat=cpm(calcNormFactors(dgeOriginal), log=T),
+        sampledata = left_join(dgeOriginal$samples,
+                               select(loocv,sample, misclassified), by = "sample"),
+        col = "group") +
+  ggthemes::scale_color_calc() +
+  ggtitle("t-SNE on original dataset, case-control status") +
+  facet_wrap(~hosp)
+
+```
+
+## Summary tables 
+
+### NKI-only classifier performance
+
+Focusing on the auROC version with downsampling.
+
+```{r}
+summarydf <- bind_rows(
+  mutate(select(report_performance(perf_kappa), -model),
+         train_hosp = "NKI",
+         predict_hosp = "VUMC & MGH",
+         optimization = "kappa"),
+  mutate(select(report_performance(perf_ds), -model),
+         train_hosp = "NKI",
+         predict_hosp = "VUMC & MGH",
+         optimization = "ds auROC"),
+  mutate(select(report_performance(perf_ds_blind), -model),
+         train_hosp = "NKI",
+         predict_hosp = "blindNKI",
+         optimization = "ds auROC")
+) %>%
+  relocate(train_hosp:optimization, .before = everything())
+
+summarydf
+
+write_csv(summarydf, here("10_interhospital_performance_summary.csv"))
+```
+
+```{r}
+sessionInfo()
+```

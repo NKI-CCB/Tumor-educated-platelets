@@ -1,0 +1,427 @@
+---
+title: "TEP performance on blind dataset"
+author: Kat Moore
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 4
+    df_print: paged
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(edgeR)
+library(RUVSeq)
+library(RColorBrewer)
+library(glmnet)
+library(doMC)
+library(here)
+library(caret)
+library(ROCR)
+library(pROC)
+#library(tictoc)
+library(ggsci)
+library(ggthemes)
+library(openxlsx)
+library(tidyverse)
+library(e1071)
+
+theme_set(theme_bw())
+```
+
+## Performance summary blind dataset
+
+The performance of TEPs on the independent blind dataset has been evaluated by Annette Heemskerk at Erasmus MC, an independent researcher not associated with either the NKI or the VUMC.
+
+```{r}
+perf_summary <- read_csv(here("dataset/third_party_val/Blind_tep_performance_summary.csv"))
+
+perf_summary
+```
+
+The performance on the blind dataset as reported by Annette is very poor compared to the performance we reported on the validation data partition when we trained the model.
+
+This is shown below for elastic net:
+
+```{r}
+enet_detailed <- read_csv(here("04_enet_detailed_performance.csv"))
+enet_detailed
+```
+
+And alongside the pso-svm AUCs:
+
+```{r}
+psosvm_detailed <- read_csv(here("03_pso_detailed_stats.csv"))
+psosvm_detailed
+```
+
+As a reminder, this was the sample split we trained those two models on.
+For the elastic net, "training" + "evaluation" were combined together into "training".
+
+```{r}
+dgeFiltered <- readRDS(here("Rds/01_dgeFiltered.Rds"))
+
+#Stage
+dgeFiltered$samples %>%
+  ggplot(aes(x = Label,  fill = stage)) +
+  geom_bar() +
+  ggsci::scale_fill_nejm() +
+  ggtitle("Stage distribution across sample labels")
+
+#Age
+dgeFiltered$samples %>%
+  ggplot(aes(x = Label, y = Age, fill = Label)) +
+  geom_boxplot() +
+  ggsci::scale_fill_nejm() +
+  ggtitle("Age distribution across sample labels")
+
+```
+
+## Decoding the blind samples
+
+Several steps are involved.
+
+### Case controls from third party
+
+Annette performed her own joining of the sample labels and the case-control status in these tabs.
+
+```{r}
+valpath = here("dataset/third_party_val/06_predictions_NKI.xlsx")
+
+cc_third <- valpath %>%
+  readxl::excel_sheets() %>%
+  set_names() %>%
+  map(readxl::read_excel, path = valpath)
+
+lapply(cc_third, head)
+
+#The sample IDs should be in the same order
+stopifnot(all(cc_third$enet_preds_fp$sample == cc_third$pso_preds_fp$sample))
+
+#Since the sample IDs are in the same order, the case control statuses should be identical too
+stopifnot(all(cc_third$enet_preds_fp$sample == cc_third$pso_preds_fp$sample))
+
+
+```
+
+It is a bit more convenient if both the probablities and the true case-control status appears in the same table.
+
+```{r}
+enet_preds <- readxl::read_excel("06_predictions.xlsx", sheet = "enet_preds_fp")
+pso_preds <- readxl::read_excel("06_predictions.xlsx", sheet = "pso_preds_fp")
+
+#Add the probabilties to the case control status, so they both appear in the same data frame
+#Also reorder/rename some columns
+join_third <- function(x, y){
+  left_join(select(x, -predictedgroup),
+            y, by = "sample") %>%
+    mutate(real.group = if_else(Status_description == "Case", "breastCancer", "healthyControl")) %>%
+    select(sample, status.description = Status_description,
+           real, pred, real.group, predicted.group, everything())
+}
+
+third <- list(
+  enet_preds_fp = join_third(x = cc_third$NKI_enet_preds_fp_realstatus,
+                             y = enet_preds),
+  pso_preds_fp = join_third(x = cc_third$NKI_pso_preds_fp_realstatus,
+                            y = pso_preds)
+)
+
+
+lapply(third, head)
+
+```
+
+### Add sample metadata
+
+These are the sample labels and key we received from the NKI team that produced the blinded validation set. It includes additional factors like age and stage.
+
+```{r}
+sample_dict <- list(key = readxl::read_excel(here("dataset/third_party_val/sample_keys",
+                                                  "Overview_NKI_breast_6-8-2020.xlsx")),
+                    val = readxl::read_excel(here("dataset/third_party_val/sample_keys",
+                                                  "202007_Validationset_caco_charact_anonymous.xlsx")))
+lapply(sample_dict, head)
+```
+
+The sequence IDs in the keys do not exactly match the sample names we got from the VUMC.
+Names of researchers have been removed, separators are standardized, and letters are all upper case.
+
+```{r}
+dgeVal <- readRDS(here("Rds/06_dgeVal.Rds"))
+
+head(colnames(dgeVal))
+```
+
+Process the Sequence IDs so that the match the sample names.
+
+```{r}
+sample_dict$key <- sample_dict$key %>%
+  mutate(sample = toupper(str_remove(Sequence_ID, "Marte_")))
+
+head(sample_dict$key, 10)
+
+print(paste("Number of samples delivered to VUMC:", nrow(sample_dict$key)))
+print(paste("Number of samples received from VUMC:", ncol(dgeVal)))
+
+#All of the samples we got back from them should match the new key column
+stopifnot(all(colnames(dgeVal) %in% sample_dict$key$sample))
+```
+
+Add the case/control status alongside age and stage to the dictionary.
+
+```{r}
+#They are not in the same order, but they do all exist
+stopifnot(all(sample_dict$key$Sample_ID %in% sample_dict$val$SampleID))
+
+dict_df <- left_join(sample_dict$key, sample_dict$val, by = c("Sample_ID" = "SampleID"))
+#dict_df %>% head()
+
+#Add a column to show whether the sample actually got sequenced
+dict_df <- dict_df %>%
+  mutate(Sequence_Exists = sample %in% colnames(dgeVal)) %>%
+  select(Sample_ID:sample, Sequence_Exists, everything())
+
+head(dict_df)
+```
+
+Which samples did not get sequenced?
+
+```{r}
+missing_samples <- dict_df %>%
+  filter(!Sequence_Exists)
+
+missing_samples
+
+#Remove from dictionary
+dict_df <- dict_df %>%
+  filter(Sequence_Exists == T)
+
+stopifnot(all(dict_df$Sequence_Exists))
+```
+
+### Agreement case control status
+
+Check to ensure that case/control status reported by the third party evaluator matches the sample keys/labels we got from the NKI team.
+Naturally this is an excessively cautious check, but given the unexpectedly poor performance, worth it.
+
+```{r}
+#Sample orders between enet and pso predictions are the same
+stopifnot(all(third$enet_preds_fp$sample == third$pso_preds_fp$sample))
+
+#Sample orders between case-control from third party and dictionary are not the same,
+#But they all can be found in the opposite dataset
+stopifnot(all(third$enet_preds_fp$sample %in% dict_df$sample) &
+            all(dict_df$sample %in% third$enet_preds_fp$sample))
+
+#Merge the case-control statuses into a single df to check them
+cc_check <- left_join(select(third$enet_preds_fp, sample, status.third = status.description),
+                      select(dict_df, sample, status.nki = Status_description),
+                      by = "sample") %>%
+  mutate(agree = (status.third == status.nki))
+
+cc_check %>% head()
+```
+
+Force a check to be sure they're all the same:
+
+```{r}
+#Should only show true
+table(cc_check$agree)
+
+#Stops if any false
+stopifnot(all(cc_check$agree))
+```
+
+### Add clinical data to output
+
+Add age and stage to the dataframes containing probabilties.
+
+```{r}
+#There are separate columns for date and time, but they're the same.
+stopifnot(all(dict_df$Afnamedatum == dict_df$Afnametijd))
+
+
+preds <- lapply(third,
+                function(x) left_join(x,
+                                      select(dict_df, sample, sample_num = Sample_ID,
+                                             time_sample = Afnamedatum, age = Age,
+                                             cT, cN, cM, stage_detailed = Stage),
+                                      by = "sample") %>%
+                  mutate(stage = as.integer(substr(stage_detailed, 1, 1))))
+
+#Add some factor levels
+preds <- lapply(preds,
+       function(x) mutate(x,
+                          status.description = factor(status.description,
+                                                      levels = c("Control", "Case")),
+                          real.group = factor(real.group,
+                                              levels = c("healthyControl", "breastCancer")),
+                          predicted.group = factor(predicted.group,
+                                                   levels = c("healthyControl", "breastCancer"))
+       )
+)
+
+lapply(preds, head)
+```
+
+Save the sample dictionary so we can use it later:
+
+```{r}
+write_csv(dict_df, here("07_validated_sample_dictionary.csv"))
+```
+
+## Checking AUC and performance
+
+Now that we've validated that the case-control status has been reported correctly, we can double-check the AUC and performance metrics.
+
+Note: the term "fixed partitions" is used to distinguish the classifiers trained on fixed data partitions with age and stage matching as described in notebook 1. This is distinct from the LOOCV classifier in notebook 5. It would take too long to train a PSO-SVM using LOOCV, so we are focusing on the fixed partitions version of the elastic net to make the comparison as fair as possible.
+
+```{r}
+report_performance <- function(df, dig = 4, doublecheck = T){
+  
+  #Calculate via pROC package
+  result.roc <- pROC::roc(
+    #a factor, numeric or character vector of true labels, typically encoded with 0 (controls) and 1 (cases)
+    response = df$real.group,
+    #the probability that a sample belongs to cases, typically from predict()
+    predictor = df$prob.breastCancer,
+    ci = T,
+    #Prints a helpful explicit message when it happens automatically
+    #levels = c("healthyControl", "breastCancer") #Should match the factor, where ref is first
+  )
+  #return(result.roc)
+  
+  if(doublecheck){
+    #Calculate AUC via ROCR package
+    #
+    pred <- ROCR::prediction(predictions = df$prob.breastCancer,
+                             labels = df$real)
+    
+    perf <- performance(pred,"tpr","fpr")
+    Auc <- performance(pred,"auc")@y.values[[1]]
+    #return(Auc)
+    
+    #print(paste("pROC: ", round(result.roc$auc,4),
+    #            "ROCR: ", round(Auc, 4))) 
+    stopifnot(round(result.roc$auc,4) == round(Auc, 4))
+  }
+  
+  confMat <- caret::confusionMatrix(data = df$predicted.group,
+                                    reference = df$real.group,
+                                    positive = "breastCancer",
+                                    mode="everything")
+  #return(confMat)
+  
+  
+  
+  tibble(AUC = round(result.roc$auc, dig),
+         CI.95 = paste(round(result.roc$ci[1], dig+1),
+                    round(result.roc$ci[3], dig+1),
+                    sep = "-"),
+         #Commented out = not calculated by Annette
+         #Accuracy = round(confMat$overall[names(confMat$overall)=="Accuracy"], dig),
+         Sensitivity = round(confMat$byClass[names(confMat$byClass)=="Sensitivity"], dig),
+         Specificity = round(confMat$byClass[names(confMat$byClass)=="Specificity"], dig),
+         PPV = round(confMat$byClass[names(confMat$byClass)=="Pos Pred Value"], dig),
+         NPV = round(confMat$byClass[names(confMat$byClass)=="Neg Pred Value"], dig),
+         #F1 =  round(confMat$byClass[names(confMat$byClass)=="F1"], dig),
+         #Kappa =  round(confMat$overall[names(confMat$overall)=="Kappa"], dig)
+  )
+}
+
+#report_performance(preds$enet_preds_fp)
+
+df_summary <- lapply(preds, report_performance) %>%
+  bind_rows(.id = "Model") %>%
+  mutate(
+    Run = "updated metadata",
+    #Input = "fixed partitions", #Redundant
+    Validation = "blindNKI",
+    Model = ifelse(Model == "enet_preds_fp", "elastic net", "pso-svm"),
+    .before = everything()
+    ) %>%
+  select(Run, Model,
+         #Input,
+         everything())
+
+df_summary
+```
+
+### Performance overview
+
+Add the data calculated by the third party and compare.
+
+```{r}
+combi_summary <- perf_summary %>%
+      slice(1:2) %>%
+      mutate(
+        Sensitivity = readr::parse_number(Sensitivity)/100,
+        Specificity = readr::parse_number(Specificity)/100,
+        PPV = readr::parse_number(PPV)/100,
+        NPV = readr::parse_number(NPV)/100,
+        Classifier = if_else(Classifier == "NKI_enet_preds_fp", "elastic net", "pso-svm"),
+        Run = "original blinded",
+        #Input = "fixed partitions", #Redundant
+        Validation = "blindNKI"
+        ) %>%
+  rename(Model = Classifier, CI.95 = `95% CI`) %>%
+  bind_rows(., df_summary) %>%
+  select(Run, Model, Validation, AUC, CI.95, everything())
+
+combi_summary
+```
+
+Write output:
+
+```{r}
+write_csv(combi_summary, here("07_blind_val_performance.csv"))
+```
+
+### ROC graphs
+
+Elastic net:
+
+```{r aucplot1}
+plotmyroc <- function(df, title){
+  
+  roc.res <- pROC::roc(
+    response = df$real.group,
+    predictor = df$prob.breastCancer,
+    ci = T,
+    #Prints a helpful explicit message when it happens automatically
+    #levels = c("healthyControl", "breastCancer") #Should match the factor, where ref is first
+  )
+  
+  rocobj <- pROC::plot.roc(roc.res,
+                           main = title, 
+                           percent=TRUE,
+                           #ci = TRUE,  #Finite xlim glitch         
+                           print.auc = TRUE,
+                           asp = NA)
+  
+  ciobj <- ci.se(rocobj,                         # CI of sensitivity
+                 specificities = seq(0, 1, 0.05)) # over a select set of specificities
+  plot(ciobj, type = "shape", col = "#1c61b6AA")     # plot as a blue shape
+  plot(ci(rocobj, of = "thresholds", thresholds = "best")) # add one threshold
+  
+}
+
+
+plotmyroc(preds$enet_preds_fp, title = "Elastic net with fixed partitions: Blind validation set")
+```
+
+PSO-SVM:
+
+```{r aucplot2}
+plotmyroc(preds$pso_preds_fp, title = "PSO-SVM with fixed partitions: Blind validation set")
+```
+
+
+```{r}
+sessionInfo()
+```
